@@ -16,6 +16,15 @@ jobs:
         with:
           python-version: '3.11'
       
+      - name: Restore firebase config
+        run: |
+          echo "${{ secrets.FIREBASE_CONFIG_BASE64 }}" | base64 -d > firebase_config.json
+      
+      - name: Restore credentials
+        run: |
+          mkdir -p credentials
+          echo "${{ secrets.CREDENTIALS_BASE64 }}" | base64 -d | tar -xzf - -C credentials/
+      
       - name: Install dependencies
         run: |
           pip install -r requirements.txt
@@ -44,6 +53,18 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      
+      - name: Restore firebase config
+        run: |
+          $config = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String("${{ secrets.FIREBASE_CONFIG_BASE64 }}"))
+          $config | Out-File -FilePath firebase_config.json -Encoding UTF8
+      
+      - name: Restore credentials
+        run: |
+          mkdir -p credentials
+          $bytes = [System.Convert]::FromBase64String("${{ secrets.CREDENTIALS_BASE64 }}")
+          [System.IO.File]::WriteAllBytes("credentials.tar.gz", $bytes)
+          tar -xzf credentials.tar.gz -C credentials/
       
       - name: Install dependencies
         run: |
