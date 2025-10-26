@@ -1,0 +1,65 @@
+name: Build TrackNote Apps
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Build macOS app
+        run: |
+          pyinstaller TrackNote.spec
+      
+      - name: Create zip
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent TrackNote.app TrackNote-macOS.zip
+      
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: TrackNote-macOS
+          path: dist/TrackNote-macOS.zip
+
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+      
+      - name: Build Windows app
+        run: |
+          pyinstaller TrackNote.spec
+      
+      - name: Create zip
+        run: |
+          cd dist
+          powershell Compress-Archive -Path TrackNote -DestinationPath TrackNote-Windows.zip
+      
+      - name: Upload Windows artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: TrackNote-Windows
+          path: dist/TrackNote-Windows.zip
