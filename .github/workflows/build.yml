@@ -61,7 +61,7 @@ jobs:
       
       - name: Restore credentials
         run: |
-          mkdir -p credentials
+          if (-not (Test-Path credentials)) { New-Item -ItemType Directory -Path credentials }
           $bytes = [System.Convert]::FromBase64String("${{ secrets.CREDENTIALS_BASE64 }}")
           [System.IO.File]::WriteAllBytes("credentials.tar.gz", $bytes)
           tar -xzf credentials.tar.gz -C credentials/
