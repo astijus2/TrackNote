@@ -1,0 +1,24 @@
+{
+  "source": "file",
+  "file_path": " ",
+  "file_headers": {
+    "date": " ",
+    "price": " ",
+    "details": " "
+  },
+
+  "spreadsheet_id": "",
+  "tab_name": "",
+  "date_col": "B",
+  "price_col": "D",
+  "details_col": "E",
+
+  "refresh_sec": 30,
+
+  "update_manifest_url": "https://<YOUR-CLOUD-LINK>/latest.json",
+
+  "version": "0.1.1",
+  "notes": "Small improvements.",
+  "mac_url": "https://<YOUR-CLOUD-LINK>/TrackNote-0.1.1-mac-arm64.dmg",
+  "win_url": "https://<YOUR-CLOUD-LINK>/TrackNote-0.1.1-Setup.exe"
+}

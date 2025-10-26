@@ -1,0 +1,9 @@
+gspread==6.2.1
+google-auth==2.40.3
+google-auth-oauthlib==1.2.2
+pandas==2.3.2
+openpyxl==3.1.5
+ttkbootstrap==1.14.2
+pyinstaller==6.16.0
+cryptography==43.0.1
+requests==2.31.0

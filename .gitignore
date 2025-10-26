@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.venv/
+venv/
+
+# CRITICAL: License keys (NEVER commit!)
+private.key
+public.key
+*.key
+license_*.txt
+license_package_*.txt
+
+# User data (NEVER commit!)
+config.json
+user_config.json
+notes_store.json
+status.json
+*-credentials.json
+
+# Build artifacts
+*.dmg
+*.dmg.sha256
+*.exe
+*.zip
+
+# IDE
+.DS_Store
+.vscode/
+.idea/
