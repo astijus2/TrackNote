@@ -9,10 +9,10 @@ jobs:
   build-mac:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       
@@ -30,7 +30,7 @@ jobs:
           ditto -c -k --sequesterRsrc --keepParent TrackNote.app TrackNote-macOS.zip
       
       - name: Upload macOS artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: TrackNote-macOS
           path: dist/TrackNote-macOS.zip
@@ -38,10 +38,10 @@ jobs:
   build-windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
       
@@ -59,7 +59,7 @@ jobs:
           powershell Compress-Archive -Path TrackNote -DestinationPath TrackNote-Windows.zip
       
       - name: Upload Windows artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: TrackNote-Windows
           path: dist/TrackNote-Windows.zip
