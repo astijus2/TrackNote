@@ -138,7 +138,15 @@ class SetupWizard(tk.Toplevel):
                                      text="",
                                      font=('Arial', 12, 'bold'),
                                      bg='#f5f5f5', fg='#333')
-        self.source_label.pack(anchor='w', pady=(0, 15))
+        self.source_label.pack(anchor='w', pady=(0, 5))
+        
+        # ERROR LABEL - Added for better validation feedback
+        self.error_label = tk.Label(self.config_frame,
+                                   text="",
+                                   font=('Arial', 10, 'bold'),
+                                   bg='#f5f5f5', fg='#dc3545',
+                                   wraplength=550)
+        self.error_label.pack(anchor='w', pady=(0, 10))
         
         # ===== FILE INPUTS =====
         self.file_config = tk.Frame(self.config_frame, bg='white',
@@ -187,16 +195,20 @@ class SetupWizard(tk.Toplevel):
                 bg='white', fg='#666', 
                 font=('Arial', 10)).pack(anchor='w', pady=(0, 8))
         
-        # Simple email box with border
+        # Simple email box with border - COPYABLE
         email_frame = tk.Frame(self.sheets_config, bg='#f0f8ff',
                               relief='solid', bd=1, padx=10, pady=10)
         email_frame.pack(fill='x', pady=(0, 20))
         
-        self.service_email = tk.Label(email_frame,
-                                     text="Loading...",
+        # Use Entry instead of Label so user can select and copy
+        self.service_email = tk.Entry(email_frame,
                                      bg='#f0f8ff', fg='#0066cc',
-                                     font=('Arial', 10, 'bold'))
-        self.service_email.pack(anchor='w')
+                                     font=('Arial', 10, 'bold'),
+                                     relief='flat',
+                                     readonlybackground='#f0f8ff',
+                                     state='readonly',
+                                     borderwidth=0)
+        self.service_email.pack(fill='x', anchor='w')
         
         # Step 2: URL section
         tk.Label(self.sheets_config, 
@@ -220,6 +232,7 @@ class SetupWizard(tk.Toplevel):
                                         insertbackground='#000000')
         self.sheet_url_entry.pack(side='left', fill='x', expand=True, ipady=5)
         self.sheet_url_entry.bind('<KeyRelease>', lambda e: self._on_url_change())
+        self.sheet_url_entry.bind('<FocusOut>', lambda e: self._validate_url_field())
         
         # Step 3: Tab name section
         tk.Label(self.sheets_config, 
@@ -295,6 +308,7 @@ class SetupWizard(tk.Toplevel):
         """Handle source selection from buttons."""
         self.source_type.set(source)
         self.status_label.config(text="")  # Clear any status messages
+        self.error_label.config(text="")  # Clear any error messages
         
         # Hide selection frame, show config frame
         self.selection_frame.pack_forget()
@@ -325,6 +339,7 @@ class SetupWizard(tk.Toplevel):
         self.config_frame.pack_forget()
         self.selection_frame.pack(fill='both', expand=True)
         self.status_label.config(text="")  # Clear status
+        self.error_label.config(text="")  # Clear error
         
         # Hide action buttons
         self.test_btn.pack_forget()
@@ -361,7 +376,13 @@ class SetupWizard(tk.Toplevel):
                     with open(cred_path, 'r') as f:
                         creds = json.load(f)
                         email = creds.get('client_email', 'No email found')
-                        self.service_email.config(text=email, fg='#0066cc', bg='#f0f8ff')
+                        # Update Entry widget text
+                        self.service_email.config(state='normal')
+                        self.service_email.delete(0, tk.END)
+                        self.service_email.insert(0, email)
+                        self.service_email.config(state='readonly', 
+                                                 fg='#0066cc', 
+                                                 readonlybackground='#f0f8ff')
                         self.cred_path_var.set(str(cred_path))
                         # Save the working path to config for next time
                         try:
@@ -375,30 +396,88 @@ class SetupWizard(tk.Toplevel):
                 continue
         
         # If we get here, no credentials file was found
-        self.service_email.config(
-            text='⚠️ credentials.json not found in app folder',
-            fg='#856404', bg='#fff3cd'
-        )
+        self.service_email.config(state='normal')
+        self.service_email.delete(0, tk.END)
+        self.service_email.insert(0, '⚠️ credentials.json not found in app folder')
+        self.service_email.config(state='readonly',
+                                 fg='#856404',
+                                 readonlybackground='#fff3cd')
+    
+    def _validate_url_field(self):
+        """Validate URL field and show immediate feedback - READ FROM WIDGET."""
+        url = self.sheet_url_entry.get().strip()  # READ FROM WIDGET
+        if not url:
+            return  # Don't show error for empty field
+        
+        try:
+            # Clean URL
+            url = url.replace(' ', '').replace('\n', '').replace('\r', '').replace('\t', '')
+            
+            # Look for Sheet ID
+            sheet_id = None
+            if '/d/' in url:
+                parts = url.split('/d/')
+                if len(parts) > 1:
+                    id_part = parts[1]
+                    for char in ['/', '?', '#']:
+                        if char in id_part:
+                            id_part = id_part.split(char)[0]
+                    sheet_id = id_part
+            
+            if not sheet_id:
+                match = re.search(r'([a-zA-Z0-9-_]{30,})', url)
+                if match:
+                    sheet_id = match.group(1)
+                    for char in ['/', '?', '#', '&']:
+                        if char in sheet_id:
+                            sheet_id = sheet_id.split(char)[0]
+            
+            if sheet_id:
+                self.error_label.config(text="")
+                self.sheet_url_entry.config(bg='white')
+            else:
+                raise ValueError("Could not find Sheet ID")
+        except:
+            self.error_label.config(text="⚠️ Please enter a valid Google Sheets URL")
+            self.sheet_url_entry.config(bg='#fff3cd')
+    
     
     def _on_url_change(self):
-        """Parse URL and extract sheet ID automatically."""
-        url = self.sheet_url_var.get().strip()
+        """Parse URL and extract sheet ID automatically - READ FROM WIDGET."""
+        url = self.sheet_url_entry.get().strip()  # READ FROM WIDGET
         if not url:
             return
         
-        # Parse Google Sheets URL
-        # Format: https://docs.google.com/spreadsheets/d/SHEET_ID/edit...
-        match = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', url)
-        if match:
-            sheet_id = match.group(1)
-            self.sheet_id_var.set(sheet_id)
+        try:
+            # Clean URL
+            url = url.replace(' ', '').replace('\n', '').replace('\r', '').replace('\t', '')
             
-            # Also try to extract tab name from URL
-            tab_match = re.search(r'[#&]gid=(\d+)', url)
-            if tab_match:
-                # For now, just use Sheet1 as default
-                # In a full implementation, you'd need to query the sheet to get tab names
-                pass
+            # Method 1: Look for /d/
+            sheet_id = None
+            if '/d/' in url:
+                parts = url.split('/d/')
+                if len(parts) > 1:
+                    id_part = parts[1]
+                    for char in ['/', '?', '#']:
+                        if char in id_part:
+                            id_part = id_part.split(char)[0]
+                    sheet_id = id_part
+            
+            # Method 2: Pattern match
+            if not sheet_id:
+                match = re.search(r'([a-zA-Z0-9-_]{30,})', url)
+                if match:
+                    sheet_id = match.group(1)
+                    for char in ['/', '?', '#', '&']:
+                        if char in sheet_id:
+                            sheet_id = sheet_id.split(char)[0]
+            
+            if sheet_id:
+                self.sheet_id_var.set(sheet_id)
+                self.error_label.config(text="")
+                self.sheet_url_entry.config(bg='white')
+        except:
+            pass  # Don't show errors while typing
     
     def _browse_file(self):
         """Browse for Excel/CSV file."""
@@ -446,12 +525,16 @@ class SetupWizard(tk.Toplevel):
             # If there's existing config, show it immediately
             if cfg.get('file_path') or cfg.get('spreadsheet_id'):
                 self._select_source(source)
+                # Clear any error messages when loading existing config
+                self.error_label.config(text="")
+                self.status_label.config(text="")
         except:
             pass
     
     def _test_connection(self):
         """Test the configured data source."""
         self.status_label.config(text="Testing connection...", fg='#666')
+        self.error_label.config(text="")  # Clear any previous errors
         self.update()
         
         try:
@@ -459,14 +542,20 @@ class SetupWizard(tk.Toplevel):
             row_count, error = test_connection(cfg)
             
             if error:
-                self.status_label.config(text=f"Error: {error}", fg='red')
+                self.error_label.config(text=f"⚠️ Connection Error: {error}")
+                self.status_label.config(text="", fg='#666')
             else:
                 self.status_label.config(
-                    text=f"Success! Connected and found {row_count} rows.",
+                    text=f"✓ Success! Connected and found {row_count} rows.",
                     fg='#28a745'
                 )
+                self.error_label.config(text="")
+        except ValueError as e:
+            self.error_label.config(text=f"⚠️ {str(e)}")
+            self.status_label.config(text="", fg='#666')
         except Exception as e:
-            self.status_label.config(text=f"Error: {str(e)}", fg='red')
+            self.error_label.config(text=f"⚠️ Error: {str(e)}")
+            self.status_label.config(text="", fg='#666')
     
     def _build_config(self):
         """Build configuration dict from UI inputs."""
@@ -478,7 +567,8 @@ class SetupWizard(tk.Toplevel):
         }
         
         if source == 'file':
-            file_path = self.file_path_var.get().strip()
+            # READ FILE PATH DIRECTLY FROM WIDGET
+            file_path = self.file_entry.get().strip()
             if not file_path:
                 raise ValueError("Please select a file")
             if not Path(file_path).exists():
@@ -490,20 +580,60 @@ class SetupWizard(tk.Toplevel):
             cfg['details_col'] = 'E'
             
         elif source == 'google_sheets':
-            # Parse URL to get sheet ID
-            url = self.sheet_url_var.get().strip()
+            # Get and validate URL - READ DIRECTLY FROM ENTRY WIDGET
+            url = self.sheet_url_entry.get().strip()  # READ FROM WIDGET NOT VARIABLE
+            
+            print(f"\n=== URL VALIDATION DEBUG ===")
+            print(f"Original URL: '{url}'")
+            print(f"URL Length: {len(url)}")
+            print(f"StringVar value: '{self.sheet_url_var.get()}'")  # Debug
+            
             if not url:
                 raise ValueError("Please enter your Google Sheets URL")
             
-            # Extract sheet ID from URL
-            match = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', url)
-            if not match:
-                raise ValueError("Invalid Google Sheets URL. Please use the full URL from your browser.")
+            # Clean the URL - remove ALL whitespace
+            url = url.replace(' ', '').replace('\n', '').replace('\r', '').replace('\t', '')
+            print(f"After cleaning: '{url}'")
             
-            sheet_id = match.group(1)
-            self.sheet_id_var.set(sheet_id)  # Update the hidden variable
+            # ULTRA SIMPLE: Just find the Sheet ID
+            # Method 1: Look for /d/ANYTHING
+            sheet_id = None
+            if '/d/' in url:
+                parts = url.split('/d/')
+                if len(parts) > 1:
+                    id_part = parts[1]
+                    # Remove everything after /, ?, #
+                    for char in ['/', '?', '#']:
+                        if char in id_part:
+                            id_part = id_part.split(char)[0]
+                    sheet_id = id_part
+                    print(f"Method 1 - Extracted from /d/: {sheet_id}")
             
-            tab_name = self.tab_name_var.get().strip() or 'Sheet1'
+            # Method 2: Look for long alphanumeric string
+            if not sheet_id:
+                match = re.search(r'([a-zA-Z0-9-_]{30,})', url)
+                if match:
+                    sheet_id = match.group(1)
+                    # Clean up
+                    for char in ['/', '?', '#', '&']:
+                        if char in sheet_id:
+                            sheet_id = sheet_id.split(char)[0]
+                    print(f"Method 2 - Pattern match: {sheet_id}")
+            
+            if not sheet_id:
+                print(f"FAILED - Could not extract ID")
+                raise ValueError("Could not find Sheet ID. Please paste the complete Google Sheets URL.")
+            
+            print(f"SUCCESS - Final Sheet ID: {sheet_id}")
+            print(f"=== VALIDATION SUCCESS ===\n")
+            
+            self.sheet_id_var.set(sheet_id)
+            
+            # READ TAB NAME DIRECTLY FROM WIDGET, NOT STRINGVAR
+            tab_name = self.tab_name_entry.get().strip() or 'Sheet1'
+            print(f"Tab name from widget: '{tab_name}'")
+            print(f"Tab name from StringVar: '{self.tab_name_var.get()}'")  # Debug
+            
             cred_path = self.cred_path_var.get().strip()
             
             if not cred_path:
@@ -552,9 +682,11 @@ class SetupWizard(tk.Toplevel):
                 pass
             
         except ValueError as e:
-            messagebox.showerror("Validation Error", str(e), parent=self)
+            self.error_label.config(text=f"⚠️ {str(e)}")
+            self.status_label.config(text="")
         except Exception as e:
-            messagebox.showerror("Error", f"Failed to save configuration:\n\n{e}", parent=self)
+            self.error_label.config(text=f"⚠️ Error: {str(e)}")
+            self.status_label.config(text="")
     
     def _cancel(self):
         """Cancel setup."""

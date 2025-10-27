@@ -14,6 +14,7 @@ import threading
 
 from parsing import split_details, normalize
 from data_source import fetch_rows
+from sheets_cache import clear_cache
 from ui import App
 from firebase_sync import FirebaseSync, load_firebase_config
 from typing import Optional, Tuple, Dict
@@ -591,9 +592,13 @@ def render(app: App):
     if not hasattr(app, '_rowkey_to_iid_cache'):
         app._rowkey_to_iid_cache = {}
     
+    # Collect visible row keys
+    visible_keys = set()
+    
     # Insert all rows and build cache incrementally
     for _, r in view.iterrows():
         key = r['key']
+        visible_keys.add(key)  # Track visible rows
         note_val = notes_map.get(key, "")
         note_mark = '📝' if str(note_val).strip() else ''
         st = STATUS.get(key, {'pkg':0,'stk':0})
@@ -606,6 +611,16 @@ def render(app: App):
         
         # Build cache incrementally (O(1) per row instead of O(n) at end)
         app._rowkey_to_iid_cache[key] = key
+    
+    # CLEANUP: Only destroy note widgets for rows NOT in visible set
+    if hasattr(app, '_note_widgets'):
+        to_remove = [iid for iid in app._note_widgets.keys() if iid not in visible_keys]
+        for iid in to_remove:
+            try:
+                app._note_widgets[iid].destroy()
+                del app._note_widgets[iid]
+            except:
+                pass
     
     # Restore selection
     kids = app.tbl.get_children()
@@ -622,6 +637,37 @@ def render(app: App):
             app.set_comment(vals[ci] if ci < len(vals) else '')
         except:
             app.set_comment('')
+    else:
+        # No rows visible - clear comment and note areas
+        app.set_comment('')
+        if hasattr(app, 'txt_note'):
+            try:
+                app.txt_note.delete('1.0', 'end')
+            except:
+                pass
+
+
+def refresh_with_cache_clear(app: App):
+    """Refresh data, clearing cache first to get fresh Google Sheets data."""
+    try:
+        cfg = read_user_config()
+        is_sheets = cfg.get('data_source') == 'google_sheets'
+        
+        if is_sheets:
+            # Clear cache to force fresh data
+            clear_cache()
+            print("🔄 Cache cleared - fetching fresh data from Google Sheets...")
+            
+            # Show status
+            if hasattr(app, 'lbl_status'):
+                app.lbl_status.config(text="🔄 Refreshing from Google Sheets...")
+                app.update_idletasks()
+        
+        # Now load with fresh data
+        load_and_render(app)
+        
+    except Exception as e:
+        messagebox.showerror("Refresh Error", f"Failed to refresh:\n\n{e}")
 
 
 def load_and_render(app: App):
@@ -984,6 +1030,7 @@ def main():
     
     app = App()
     app.withdraw()  # Keep hidden until fully loaded
+    app._is_closing = False  # Flag to prevent threading crashes on close
     
     # === Initialize performance features ===
     try:
@@ -1080,7 +1127,7 @@ def main():
     configure_tags(app)
 
     # hook up buttons
-    app.btn_refresh.configure(command=lambda: load_and_render_async(app))
+    app.btn_refresh.configure(command=lambda: refresh_with_cache_clear(app))
     app.btn_clear_filters.configure(command=lambda: clear_filters(app))
     app.btn_select_all.configure(command=lambda: select_all_visible(app))
     app.btn_clear_sel.configure(command=lambda: clear_selection(app))
@@ -1217,6 +1264,9 @@ def main():
     # ===== AUTO-REFRESH: 60 seconds + instant focus refresh =====
     def auto_refresh():
         try:
+            # Check if app is closing
+            if getattr(app, '_is_closing', False):
+                return
             if not app.winfo_exists():
                 return  # Window destroyed, stop refreshing
             load_and_render(app)
@@ -1224,7 +1274,7 @@ def main():
             pass
         finally:
             try:
-                if app.winfo_exists():
+                if not getattr(app, '_is_closing', False) and app.winfo_exists():
                     app.after(60000, auto_refresh)  # Every 60 seconds
             except:
                 pass  # Window destroyed, stop
@@ -1232,6 +1282,9 @@ def main():
     def on_focus_refresh(event=None):
         """INSTANT refresh when app regains focus."""
         try:
+            # Check if app is closing
+            if getattr(app, '_is_closing', False):
+                return
             if app.winfo_exists():
                 load_and_render(app)
         except Exception:
@@ -1245,6 +1298,9 @@ def main():
     # === START MEMORY MANAGEMENT (every 60 seconds) ===
     def periodic_memory_check():
         try:
+            # Check if app is closing
+            if getattr(app, '_is_closing', False):
+                return
             if not app.winfo_exists():
                 return  # Window destroyed, stop
             MemoryManager.cleanup_widgets(app)
@@ -1253,13 +1309,46 @@ def main():
             pass
         finally:
             try:
-                if app.winfo_exists():
+                if not getattr(app, '_is_closing', False) and app.winfo_exists():
                     app.after(60000, periodic_memory_check)
             except:
                 pass  # Window destroyed, stop
     
     app.after(60000, periodic_memory_check)
     # === END MEMORY MANAGEMENT ===
+
+    # === PROPER WINDOW CLOSE HANDLER (FIX FOR THREADING CRASH) ===
+    def on_closing():
+        """Clean shutdown to prevent threading errors."""
+        try:
+            # Set flag to stop background operations
+            app._is_closing = True
+            
+            # Cancel all pending after() callbacks
+            for after_id in app.tk.call('after', 'info'):
+                try:
+                    app.after_cancel(after_id)
+                except:
+                    pass
+            
+            # Stop Firebase listener if active
+            if FIREBASE_SYNC and FIREBASE_SYNC.is_connected():
+                try:
+                    FIREBASE_SYNC.stop_listener()
+                except:
+                    pass
+            
+            # Destroy window
+            app.quit()
+            app.destroy()
+        except Exception:
+            # Force exit if cleanup fails
+            import sys
+            sys.exit(0)
+    
+    # Register close handler
+    app.protocol("WM_DELETE_WINDOW", on_closing)
+    # === END WINDOW CLOSE HANDLER ===
 
     # Close loading screen and show main app
     if loading:
