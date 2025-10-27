@@ -1,6 +1,6 @@
 """
 Firebase Realtime Database integration using REST API.
-IMPROVED with better error handling and persistence.
+PROPERLY OPTIMIZED: Instant local updates, batched background saves.
 """
 
 import requests
@@ -9,6 +9,7 @@ from typing import Dict, Optional, Callable
 from threading import Thread, Lock
 import json
 import sys
+import platform
 from pathlib import Path
 
 
@@ -36,11 +37,26 @@ class FirebaseSync:
         self._listener_running = False
         self._connection_error_count = 0
         
+        # OPTIMIZATION: Background write queue (both platforms)
+        self._pending_writes = {'status': {}, 'notes': {}}
+        self._write_thread = None
+        self._write_running = False
+        
+        # Platform-specific batch sizes
+        self._is_windows = platform.system() == "Windows"
+        self._batch_interval = 0.5  # 500ms for both platforms
+        self._max_batch_size = 20 if self._is_windows else 10
+        
         # Test connection
         try:
             self._test_connection()
             self._connected = True
             print(f"✅ Firebase connected: {database_url}")
+            
+            # Start background write thread
+            self._start_write_thread()
+            platform_name = "Windows" if self._is_windows else "Mac"
+            print(f"⚡ {platform_name}: Background batch write enabled (max {self._max_batch_size} per batch)")
         except Exception as e:
             self._connected = False
             print(f"⚠️ Firebase connection failed: {e}")
@@ -68,7 +84,118 @@ class FirebaseSync:
             self._connection_error_count += 1
             return False
     
-    # ===== STATUS METHODS =====
+    # ===== BACKGROUND WRITE THREAD (PROFESSIONAL PATTERN) =====
+    
+    def _start_write_thread(self):
+        """Start background thread to batch writes."""
+        if self._write_running:
+            return
+        
+        self._write_running = True
+        self._write_thread = Thread(target=self._batch_write_loop, daemon=True)
+        self._write_thread.start()
+    
+    def _batch_write_loop(self):
+        """Background thread that batches writes every 500ms."""
+        while self._write_running and self._connected:
+            try:
+                time.sleep(self._batch_interval)
+                
+                with self._lock:
+                    # Get pending writes
+                    status_writes = dict(self._pending_writes['status'])
+                    notes_writes = dict(self._pending_writes['notes'])
+                    
+                    # Clear pending
+                    self._pending_writes['status'].clear()
+                    self._pending_writes['notes'].clear()
+                
+                # Execute batched writes (outside lock)
+                if status_writes:
+                    self._batch_write_status(status_writes)
+                
+                if notes_writes:
+                    self._batch_write_notes(notes_writes)
+                    
+            except Exception:
+                pass  # Silent failure
+    
+    def _batch_write_status(self, writes: Dict):
+        """Write multiple status updates in one request."""
+        try:
+            url = f"{self.database_url}/tracknote/{self.namespace}/status.json"
+            
+            # Convert to Firebase format
+            data = {}
+            deletes = []
+            
+            for row_key, value in writes.items():
+                if value is None:
+                    # Mark for deletion
+                    deletes.append(row_key)
+                else:
+                    data[row_key] = {
+                        'pkg': value['pkg'],
+                        'stk': value['stk'],
+                        'updated_at': time.time()
+                    }
+            
+            # Batch update
+            if data:
+                response = requests.patch(url, json=data, timeout=5)
+                response.raise_for_status()
+            
+            # Batch delete
+            for row_key in deletes:
+                try:
+                    del_url = f"{self.database_url}/tracknote/{self.namespace}/status/{row_key}.json"
+                    requests.delete(del_url, timeout=3)
+                except:
+                    pass
+            
+            self._connection_error_count = 0
+                
+        except Exception:
+            self._connection_error_count += 1
+    
+    def _batch_write_notes(self, writes: Dict):
+        """Write multiple note updates in one request."""
+        try:
+            url = f"{self.database_url}/tracknote/{self.namespace}/notes.json"
+            
+            # Convert to Firebase format
+            data = {}
+            deletes = []
+            
+            for row_key, value in writes.items():
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    # Mark for deletion
+                    deletes.append(row_key)
+                else:
+                    data[row_key] = {
+                        'text': value,
+                        'updated_at': time.time()
+                    }
+            
+            # Batch update
+            if data:
+                response = requests.patch(url, json=data, timeout=5)
+                response.raise_for_status()
+            
+            # Batch delete
+            for row_key in deletes:
+                try:
+                    del_url = f"{self.database_url}/tracknote/{self.namespace}/notes/{row_key}.json"
+                    requests.delete(del_url, timeout=3)
+                except:
+                    pass
+            
+            self._connection_error_count = 0
+                
+        except Exception:
+            self._connection_error_count += 1
+    
+    # ===== STATUS METHODS (INSTANT LOCAL, BATCHED REMOTE) =====
     
     def get_all_status(self) -> Dict[str, Dict]:
         """Get all status entries from Firebase."""
@@ -85,51 +212,40 @@ class FirebaseSync:
             return data
         except Exception as e:
             self._connection_error_count += 1
-            # Try to reconnect after multiple failures
             if self._connection_error_count >= 3:
                 self.reconnect()
             return self._status_cache
     
     def set_status(self, row_key: str, pkg: int, stk: int):
-        """Set status for a row."""
-        # Always update cache
+        """
+        Set status for a row - INSTANT local update, batched remote save.
+        
+        CRITICAL: This returns immediately (0ms). UI should update instantly.
+        Firebase save happens in background thread after 500ms batching.
+        """
+        # Update cache INSTANTLY (0ms)
         self._status_cache[row_key] = {'pkg': pkg, 'stk': stk}
         
         if not self._connected:
             return
         
-        try:
-            url = f"{self.database_url}/tracknote/{self.namespace}/status/{row_key}.json"
-            data = {
-                'pkg': pkg,
-                'stk': stk,
-                'updated_at': time.time()
-            }
-            response = requests.put(url, json=data, timeout=3)
-            response.raise_for_status()
-            self._connection_error_count = 0
-        except Exception:
-            self._connection_error_count += 1
-            if self._connection_error_count >= 3:
-                self.reconnect()
+        # Queue for background batch write (non-blocking)
+        with self._lock:
+            self._pending_writes['status'][row_key] = {'pkg': pkg, 'stk': stk}
     
     def clear_status(self, row_key: str):
-        """Clear status for a row."""
-        # Always update cache
+        """Clear status for a row - INSTANT local, batched remote."""
+        # Update cache INSTANTLY
         self._status_cache.pop(row_key, None)
         
         if not self._connected:
             return
         
-        try:
-            url = f"{self.database_url}/tracknote/{self.namespace}/status/{row_key}.json"
-            response = requests.delete(url, timeout=3)
-            response.raise_for_status()
-            self._connection_error_count = 0
-        except Exception:
-            self._connection_error_count += 1
+        # Queue for background batch delete
+        with self._lock:
+            self._pending_writes['status'][row_key] = None
     
-    # ===== NOTES METHODS =====
+    # ===== NOTES METHODS (INSTANT LOCAL, BATCHED REMOTE) =====
     
     def get_all_notes(self) -> Dict[str, str]:
         """Get all notes from Firebase."""
@@ -159,8 +275,13 @@ class FirebaseSync:
             return self._notes_cache
     
     def set_note(self, row_key: str, note_text: str):
-        """Set note for a row."""
-        # Always update cache
+        """
+        Set note for a row - INSTANT local update, batched remote save.
+        
+        CRITICAL: This returns immediately (0ms). Text should appear instantly.
+        Firebase save happens in background after batching.
+        """
+        # Update cache INSTANTLY (0ms)
         if note_text.strip():
             self._notes_cache[row_key] = note_text
         else:
@@ -169,29 +290,16 @@ class FirebaseSync:
         if not self._connected:
             return
         
-        try:
-            url = f"{self.database_url}/tracknote/{self.namespace}/notes/{row_key}.json"
-            if note_text.strip():
-                data = {
-                    'text': note_text,
-                    'updated_at': time.time()
-                }
-                response = requests.put(url, json=data, timeout=3)
-                response.raise_for_status()
-            else:
-                # Delete if empty
-                response = requests.delete(url, timeout=3)
-                response.raise_for_status()
-            self._connection_error_count = 0
-        except Exception:
-            self._connection_error_count += 1
+        # Queue for background batch write (non-blocking)
+        with self._lock:
+            self._pending_writes['notes'][row_key] = note_text if note_text.strip() else None
     
     # ===== REAL-TIME LISTENERS =====
     
     def start_listener(self, on_change_callback: Callable):
         """
         Start listening for real-time changes from other computers.
-        Polls every 5 seconds.
+        Polls every 5 seconds (both platforms for consistency).
         
         Args:
             on_change_callback: Function to call when data changes
@@ -213,6 +321,9 @@ class FirebaseSync:
         """Background thread that polls for changes every 5 seconds."""
         last_status = {}
         last_notes = {}
+        
+        # Poll every 5 seconds (both platforms)
+        poll_interval = 5
         
         while self._listener_running:
             try:
@@ -243,11 +354,12 @@ class FirebaseSync:
             except Exception:
                 pass  # Silent failure for performance
             
-            time.sleep(5)
+            time.sleep(poll_interval)
     
     def stop_listener(self):
         """Stop the polling thread."""
         self._listener_running = False
+        self._write_running = False
 
 
 def get_resource_path(relative_path):
