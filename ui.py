@@ -7,6 +7,9 @@ from user_data import load_notes, save_notes, user_data_dir
 import subprocess, platform
 import time
 
+# Platform detection for Windows-specific fixes
+IS_WINDOWS = platform.system() == "Windows"
+
 # Show "Open Data/Logs" only in dev or when explicitly enabled
 def _support_tools_enabled() -> bool:
     import os, sys
@@ -608,13 +611,21 @@ class App(tk.Tk):
                         editor = self._make_note_entry(iid)
                         self._note_widgets[iid] = editor
                     
-                    # Quick position update
-                    pad_x, pad_y = 4, 3
+                    # Quick position update - WINDOWS FIX
+                    if IS_WINDOWS:
+                        # Windows needs less aggressive padding
+                        pad_x, pad_y = 4, 1
+                        y_offset = 1
+                    else:
+                        # Mac original values
+                        pad_x, pad_y = 4, 3
+                        y_offset = 0
+                    
                     editor.place_configure(
                         x=rx + x + pad_x,
-                        y=ry + y + pad_y,
+                        y=ry + y + pad_y - y_offset,
                         width=w - 2*pad_x - 2,
-                        height=h - 2*pad_y - 1
+                        height=h - 2*pad_y + 2
                     )
                     editor.lift()
                 except:
@@ -697,13 +708,21 @@ class App(tk.Tk):
                         editor = self._make_note_entry(iid)
                         self._note_widgets[iid] = editor
                     
-                    # Quick position update
-                    pad_x, pad_y = 4, 3
+                    # Quick position update - WINDOWS FIX
+                    if IS_WINDOWS:
+                        # Windows needs less aggressive padding
+                        pad_x, pad_y = 4, 1
+                        y_offset = 1
+                    else:
+                        # Mac original values
+                        pad_x, pad_y = 4, 3
+                        y_offset = 0
+                    
                     editor.place_configure(
                         x=rx + x + pad_x,
-                        y=ry + y + pad_y,
+                        y=ry + y + pad_y - y_offset,
                         width=w - 2*pad_x - 2,
-                        height=h - 2*pad_y - 1
+                        height=h - 2*pad_y + 2
                     )
                     editor.lift()
                 except:
@@ -715,21 +734,41 @@ class App(tk.Tk):
 
     def _make_note_entry(self, iid):
         """OPTIMIZED single-line Text widget for inline note editing."""
-        e = tk.Text(
-            self._overlay_parent,
-            height=1, 
-            wrap='none',
-            bd=1, 
-            relief='solid',
-            highlightthickness=1,
-            highlightbackground="#D0D0D0", 
-            highlightcolor="#4A90E2",
-            bg="white", 
-            fg="black", 
-            insertbackground="black", 
-            insertwidth=1,
-            font=('Segoe UI', 10)
-        )
+        # WINDOWS FIX: Different Text widget config for proper text visibility
+        if IS_WINDOWS:
+            # Windows needs explicit internal padding for text to show properly
+            e = tk.Text(
+                self._overlay_parent,
+                height=1, 
+                wrap='none',
+                bd=1, 
+                relief='solid',
+                highlightthickness=0,
+                bg="white", 
+                fg="black", 
+                insertbackground="black", 
+                insertwidth=1,
+                font=('Segoe UI', 10),
+                padx=2,
+                pady=1
+            )
+        else:
+            # Mac original config
+            e = tk.Text(
+                self._overlay_parent,
+                height=1, 
+                wrap='none',
+                bd=1, 
+                relief='solid',
+                highlightthickness=1,
+                highlightbackground="#D0D0D0", 
+                highlightcolor="#4A90E2",
+                bg="white", 
+                fg="black", 
+                insertbackground="black", 
+                insertwidth=1,
+                font=('Segoe UI', 10)
+            )
         
         # Block text selection to prevent visual glitches
         e.configure(
@@ -738,6 +777,13 @@ class App(tk.Tk):
             selectbackground='white',
             inactiveselectbackground='white',
         )
+        
+        # WINDOWS OPTIMIZATION: Disable undo for better performance
+        if IS_WINDOWS:
+            try:
+                e.configure(undo=False, autoseparators=False)
+            except:
+                pass
         
         # Let Text handle typing first, then block propagation
         try:

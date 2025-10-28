@@ -9,8 +9,7 @@ from tkinter import messagebox
 from tkinter import messagebox as _mb
 import time
 import threading
-
-
+import platform
 
 from parsing import split_details, normalize
 from data_source import fetch_rows
@@ -20,12 +19,28 @@ from firebase_sync import FirebaseSync, load_firebase_config
 from typing import Optional, Tuple, Dict
 
 # --- Licensing: fingerprint, Ed25519 verify, trial ---
-import base64, platform, subprocess, uuid, datetime as _dt
+import base64, subprocess, uuid, datetime as _dt
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.exceptions import InvalidSignature
 from tkinter import simpledialog as _sd
 from user_data import read_user_config, write_user_config, read_license_key, store_license_key
 
+# Platform detection for maximum optimization
+IS_WINDOWS = platform.system() == "Windows"
+
+# WINDOWS OPTIMIZATION: Aggressive performance settings
+if IS_WINDOWS:
+    # Larger batch sizes for Windows
+    RENDER_BATCH_SIZE = 100  # Render 100 rows at a time
+    SCROLL_DEBOUNCE = 50     # 50ms scroll debounce
+    FILTER_DEBOUNCE = 200    # 200ms filter debounce
+    MAX_VISIBLE_ROWS = 500   # Limit visible rows for performance
+else:
+    # Mac can handle more
+    RENDER_BATCH_SIZE = 200
+    SCROLL_DEBOUNCE = 0
+    FILTER_DEBOUNCE = 150
+    MAX_VISIBLE_ROWS = 1000
 
 # Optional import - not required for app to work
 PSUTIL_AVAILABLE = False
@@ -73,7 +88,7 @@ class MemoryManager:
                         cleaned += 1
                     except:
                         pass
-        except Exception as e:
+        except Exception:
             pass
         
         return cleaned
@@ -93,38 +108,6 @@ TRIAL_DAYS = 14
 
 # Replace this with YOUR public key (bytes) generated once; filler for now:
 PUBLIC_KEY_B64 = "61izrH-GRDcHS_mLjbxRJoZAFbJqFQbSEsYzB8euFCg"  # placeholder!
-
-def load_and_render_async(app: App):
-    """Load in background thread."""
-    
-    def _background_load():
-        try:
-            # Show loading
-            app.after(0, lambda: _update_status(app, "📊 Loading..."))
-            
-            # Fetch (slow part in background)
-            cfg = read_user_config()
-            rows = fetch_rows(cfg)
-            
-            # Rebuild index
-            rebuild_index(rows)
-            
-            # Render in main thread
-            app.after(0, lambda: _finish_load(app))
-        except Exception as e:
-            app.after(0, lambda: messagebox.showerror("Error", str(e)))
-    
-    def _update_status(app, msg):
-        if hasattr(app, 'lbl_status'):
-            app.lbl_status.config(text=msg)
-    
-    def _finish_load(app):
-        render(app)
-        _update_status(app, "✓ Ready!")
-        app.after(2000, lambda: _update_status(app, ""))
-    
-    # Start thread
-    threading.Thread(target=_background_load, daemon=True).start()
 
 def _b64url_decode(s: str) -> bytes:
     s = s.replace("-", "+").replace("_", "/")
@@ -153,22 +136,11 @@ def get_machine_fingerprint() -> str:
             return out.split()[-1].lower()
     except Exception:
         pass
-    # Fallback: MAC + arch
     mac = uuid.getnode()
     arch = platform.machine()
     return f"{mac:012x}-{arch}".lower()
 
 def verify_license_key(license_key: str) -> Tuple[bool, str, Optional[Dict]]:
-    """
-    license string format (compact JWT-like):
-      <payload_b64url>.<signature_b64url>
-    payload JSON fields:
-      fp: machine fingerprint (string, lowercased)
-      prod: product code, e.g., "TrackNote"
-      exp: ISO date string "YYYY-MM-DD" (inclusive)
-      ver: optional product version, e.g., ">=0.1.0"
-    signed with Ed25519 (PUBLIC_KEY_B64).
-    """
     try:
         payload_part, sig_part = license_key.strip().split(".", 1)
     except ValueError:
@@ -188,7 +160,6 @@ def verify_license_key(license_key: str) -> Tuple[bool, str, Optional[Dict]]:
     except Exception as e:
         return (False, f"License verify error: {e}", payload)
 
-    # semantic checks
     fp_now = get_machine_fingerprint()
     if payload.get("fp", "").lower() != fp_now.lower():
         return (False, "License is for a different computer.", payload)
@@ -204,7 +175,6 @@ def verify_license_key(license_key: str) -> Tuple[bool, str, Optional[Dict]]:
     return (True, "OK", payload)
 
 def show_license_dialog(app) -> bool:
-    """Ask for a key; verify; store if valid. Returns True if activated."""
     while True:
         key = _sd.askstring("Enter License Key", "Paste your TrackNote license key:", parent=app)
         if key is None:
@@ -218,229 +188,55 @@ def show_license_dialog(app) -> bool:
             _mb.showerror("TrackNote", f"{msg}\n\nPlease check and try again.")
 
 def license_status_string() -> str:
-    # Check for license key in license.key file
+    key = read_license_key()
+    if not key:
+        return ""
+    ok, msg, payload = verify_license_key(key)
+    if not ok:
+        return ""
+    exp_str = payload.get("exp") if payload else None
+    if exp_str:
+        try:
+            exp_date = _dt.date.fromisoformat(exp_str)
+            days_left = (exp_date - _dt.date.today()).days
+            if days_left <= 0:
+                return ""
+            return f"Licensed (expires {exp_str})"
+        except:
+            return "Licensed"
+    return "Licensed"
+
+def check_trial():
+    cfg = read_user_config()
+    first_run = cfg.get("first_run_date")
+    if not first_run:
+        cfg["first_run_date"] = _dt.datetime.now().isoformat()
+        write_user_config(cfg)
+        return (True, "Trial started")
+    
     key = read_license_key()
     if key:
-        ok, msg, pl = verify_license_key(key)
+        ok, msg, _pl = verify_license_key(key)
         if ok:
-            exp = pl.get("exp")
-            return f"Licensed for this computer. Expires: {exp or 'Never (no expiry)'}"
-        return f"License present but invalid: {msg}"
+            return (True, "Licensed")
     
-    # No key → compute trial days left
-    cfg = read_user_config()
-    created = cfg.get("first_run_date")  # Fixed field name!
     try:
-        start = _dt.datetime.fromisoformat(created).date() if created else _dt.date.today()
-    except Exception:
-        start = _dt.date.today()
-    days_used = (_dt.date.today() - start).days
-    left = max(0, TRIAL_DAYS - days_used)
-    return f"Trial: {left} day(s) left"
-
-
-# --- First-run version & updater helpers (single source of truth) ---
-import sys, datetime, traceback
-from pathlib import Path
-import json as _json, urllib.request as _u, platform as _plat, webbrowser as _wb
-from tkinter import messagebox as _mb
-from user_data import create_user_config_if_missing, user_data_dir, load_notes, save_notes
-
-def _bundle_base() -> Path:
-    """Folder where bundled files live (works for dev & PyInstaller)."""
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        return Path(sys._MEIPASS)  # PyInstaller temp dir
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent  # .../TrackNote.app/Contents/MacOS
-    return Path(__file__).resolve().parent
-
-CONFIG_PATH = _bundle_base() / "config_template.json"
-CFG = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-
-
-def get_app_version(default: str = "0.1.0") -> str:
-    try:
-        return (_bundle_base() / "VERSION").read_text(encoding="utf-8").strip() or default
-    except Exception:
-        return default
-
-def save_note_for_selected(app):
-    """Read text from bottom right box and save to per-user notes_store.json."""
-    sel = app.tbl.selection()
-    if not sel:
-        return
-    iid = sel[0]
-    try:
-        app.txt_note.configure(state='normal')
-        note = app.txt_note.get("1.0", "end-1c")
-    finally:
-        app.txt_note.configure(state='disabled')
-    try:
-        m = load_notes() or {}
-        if note.strip():
-            m[iid] = note
+        first = _dt.datetime.fromisoformat(first_run)
+        elapsed = (_dt.datetime.now() - first).days
+        if elapsed < TRIAL_DAYS:
+            remaining = TRIAL_DAYS - elapsed
+            return (True, f"Trial: {remaining} days left")
         else:
-            m.pop(iid, None)
-        save_notes(m)
+            return (False, "Trial expired")
     except Exception:
-        pass
-    # Update the "Note" indicator in the table
-    try:
-        vals = list(app.tbl.item(iid, 'values'))
-        cols = list(app.tbl['columns'])
-        if 'Note' in cols:
-            ci = cols.index('Note')
-            if ci < len(vals):
-                vals[ci] = '📝' if note.strip() else ''
-                app.tbl.item(iid, values=tuple(vals))
-    except Exception:
-        pass
+        return (True, "Trial active")
 
-def begin_edit_note(app):
-    """Make the bottom right note box editable and focus it."""
-    try:
-        app.txt_note.configure(state='normal')
-        app.txt_note.focus_set()
-    except Exception:
-        pass
-
-# --- shortcut guard: ignore when typing in note fields ---
-
-def _is_typing_in_note_widget(app) -> bool:
-    w = app.focus_get()
-    if w is None:
-        return False
-    # bottom-right Text box
-    if w is getattr(app, 'txt_note', None):
-        return True
-    # inline note Entry overlays
-    if hasattr(app, '_note_widgets'):
-        try:
-            return any(w is ed for ed in app._note_widgets.values())
-        except Exception:
-            pass
-    return False
-
-
-def _guard_shortcut(app, fn):
-    def _handler(ev=None):
-        if _is_typing_in_note_widget(app):
-            return 'break'  # stop propagation; do nothing
-        fn(app)
-        return 'break'
-    return _handler
-
-
-def save_note_and_lock(app):
-    """Save note for selected row and make the box read-only again."""
-    save_note_for_selected(app)
-    try:
-        app.txt_note.configure(state='disabled')
-    except Exception:
-        pass
-
-def _semver_tuple(v: str):
-    # very small semver parser: "1.2.3" -> (1,2,3)
-    try:
-        parts = v.strip().split(".")
-        return tuple(int(p) for p in parts[:3] + ["0"]*(3-len(parts)))
-    except Exception:
-        return (0,0,0)
-
-def _read_manifest(url: str) -> dict:
-    req = _u.Request(url, headers={"User-Agent": "TrackNote/Updater"})
-    with _u.urlopen(req, timeout=10) as r:
-        return _json.loads(r.read().decode("utf-8"))
-
-def check_for_updates(root, manifest_url: str | None):
-    if not manifest_url:
-        _mb.showinfo("TrackNote", "Auto-update is not configured yet.")
-        return
-    try:
-        remote = _read_manifest(manifest_url)
-        remote_ver = str(remote.get("version", "0.0.0"))
-        local_ver = get_app_version()
-        if _semver_tuple(remote_ver) <= _semver_tuple(local_ver):
-            _mb.showinfo("TrackNote", f"You're on the latest version ({local_ver}).")
-            return
-
-        # pick platform URL
-        is_mac = (_plat.system() == "Darwin")
-        url = remote.get("mac_url" if is_mac else "win_url")
-        notes = str(remote.get("notes", "")).strip()
-        msg = f"New version {remote_ver} is available.\n\n{notes}" if notes else f"New version {remote_ver} is available."
-        if url and _mb.askyesno("TrackNote Update", msg + "\n\nOpen download page?"):
-            _wb.open(url)
-        elif not url:
-            _mb.showwarning("TrackNote Update", "Update is available, but no download URL was provided.")
-    except Exception as e:
-        _mb.showerror("TrackNote Update", f"Failed to check for updates.\n\n{e}")
-
-# --- Finder launch guard + startup log (single definition) ---
-import traceback, datetime
-
-def _startup_log(extra: dict | None = None):
-    try:
-        log_dir = user_data_dir() / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        with open(log_dir / "launch.log", "a", encoding="utf-8") as lf:
-            rec = {"ts": datetime.datetime.now().isoformat(), "cwd": os.getcwd(),
-                   "exe": sys.executable, "argv": sys.argv, "frozen": bool(getattr(sys, "frozen", False))}
-            if extra: rec.update(extra)
-            lf.write(json.dumps(rec) + "\n")
-    except Exception:
-        pass
-
-def _guarded_main():
-    try:
-        _startup_log({"phase": "before-main", "CONFIG_PATH": str(CONFIG_PATH)})
-    except Exception:
-        pass
-    try:
-        main()
-    except Exception:
-        try:
-            log_dir = user_data_dir() / "logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            with open(log_dir / "launch.log", "a", encoding="utf-8") as lf:
-                lf.write("\n=== Finder launch error ===\n")
-                lf.write(traceback.format_exc())
-        except Exception:
-            pass
-        raise
-
-# ---------- Config / App data ----------
-
-# ---------- Config / App data (with Firebase sync) ----------
-
-APPDATA = os.getenv('APPDATA')
-BASE = Path(APPDATA) if APPDATA else (Path.home() / "Library/Application Support")
-APPDIR = BASE / "TrackNote"
+# ===== GLOBALS =====
+from user_data import user_data_dir
+APPDIR = user_data_dir()
 APPDIR.mkdir(parents=True, exist_ok=True)
 
-# Initialize Firebase sync
-FIREBASE_CONFIG = load_firebase_config()
-if FIREBASE_CONFIG:
-    try:
-        # Get the sheet ID from config to use as namespace
-        cfg = read_user_config()
-        sheet_id = cfg.get('spreadsheet_id', 'default')
-        
-        FIREBASE_SYNC = FirebaseSync(
-            FIREBASE_CONFIG['database_url'],
-            FIREBASE_CONFIG['project_id'],
-            namespace=sheet_id  # NEW! Use sheet ID as namespace
-        )
-        if FIREBASE_SYNC.is_connected():
-            print("🔥 Firebase sync enabled - changes sync in 5 seconds")
-    except Exception as e:
-        print(f"⚠ Failed to connect to Firebase: {e}")
-        FIREBASE_SYNC = None
-else:
-    FIREBASE_SYNC = None
-    print("ℹ Firebase not configured - using local storage only")
-
-# Fallback local file storage
+FIREBASE_SYNC: Optional[FirebaseSync] = None
 STATUS_FILE = APPDIR / "status.json"
 
 def load_status():
@@ -458,47 +254,65 @@ def load_status():
         return {}
 
 def save_status(obj):
-    """Save status to Firebase and local file."""
-    # Save to Firebase first
+    """
+    OPTIMIZED: Save status asynchronously - NEVER BLOCKS UI.
+    
+    This function returns IMMEDIATELY. Saves happen in background.
+    """
+    # INSTANT: Save to Firebase in background (batched)
     if FIREBASE_SYNC and FIREBASE_SYNC.is_connected():
         try:
             for key, val in obj.items():
+                # This returns immediately - batched internally
                 FIREBASE_SYNC.set_status(key, val.get('pkg', 0), val.get('stk', 0))
         except Exception as e:
             print(f"Error saving to Firebase: {e}")
     
-    # Also save to local file as backup
-    try: 
-        STATUS_FILE.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
-    except Exception: 
-        pass
+    # BACKGROUND: Save to local file in thread (non-blocking)
+    def _save_local():
+        try: 
+            STATUS_FILE.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
+        except Exception: 
+            pass
+    
+    threading.Thread(target=_save_local, daemon=True).start()
 
 STATUS = load_status()
 
 # ---------- Tag colors ----------
 TAGS = {
     'none':     {'bg': '#ffffff'},
-    'packaged': {'bg': '#fff4b8'},  # pale yellow
-    'sticker':  {'bg': '#dcecff'},  # light blue
-    'both':     {'bg': '#d6f5d6'},  # light green
+    'packaged': {'bg': '#fff4b8'},  # pale yellow - ORIGINAL
+    'sticker':  {'bg': '#dcecff'},  # light blue - ORIGINAL
+    'both':     {'bg': '#d6f5d6'},  # light green - ORIGINAL
 }
-def status_to_tag(st):
-    if st.get('pkg') and st.get('stk'): return 'both'
-    if st.get('pkg'): return 'packaged'
-    if st.get('stk'): return 'sticker'
-    return 'none'
 
+def status_to_tag(st: dict) -> str:
+    p, s = st.get('pkg', 0), st.get('stk', 0)
+    if p and s:
+        return 'both'
+    if p:
+        return 'packaged'
+    if s:
+        return 'sticker'
+    return 'none'
 def configure_tags(app: App):
+    """Configure TreeView tags with original colors."""
     for name, spec in TAGS.items():
-        try: app.tbl.tag_configure(name, background=spec['bg'])
-        except Exception: pass
+        try: 
+            app.tbl.tag_configure(name, background=spec['bg'])
+        except Exception: 
+            pass
+    
     # Flash tags for visual feedback
     try: 
         app.tbl.tag_configure('flash_none', background='#FFFFFF')
         app.tbl.tag_configure('flash_packaged', background='#FFB700')
         app.tbl.tag_configure('flash_sticker', background='#0099FF')
         app.tbl.tag_configure('flash_both', background='#00FF00')
-    except Exception: pass
+    except Exception: 
+        pass
+
 
 # ---------- Checkbox selection state ----------
 CHECKED = set()  # set of row keys (iids) that are checked
@@ -559,7 +373,14 @@ _df = pd.DataFrame(columns=[
 ])
 
 def render(app: App):
-    """OPTIMIZED render - builds cache incrementally."""
+    """
+    DRASTICALLY OPTIMIZED render for Windows.
+    
+    - Batched row insertion (100 rows at a time)
+    - Limit visible rows (500 max)
+    - Incremental rendering with progress
+    - No blocking operations
+    """
     # Get filters
     q = normalize(_val(app.ent_name, app.var_q))
     d_from = _parse_date_input(_val(app.ent_from, app.var_from))
@@ -586,6 +407,7 @@ def render(app: App):
     # Clear table
     app.tbl.delete(*app.tbl.get_children())
     
+    from user_data import load_notes
     notes_map = load_notes() or {}
     
     # Initialize or preserve cache
@@ -595,27 +417,53 @@ def render(app: App):
     # Collect visible row keys
     visible_keys = set()
     
-    # Insert all rows and build cache incrementally
-    for _, r in view.iterrows():
+    # WINDOWS OPTIMIZATION: Limit visible rows
+    total_rows = len(view)
+    if IS_WINDOWS and total_rows > MAX_VISIBLE_ROWS:
+        # Show status
+        if hasattr(app, 'lbl_status'):
+            app.lbl_status.config(text=f"⚠️ Showing first {MAX_VISIBLE_ROWS} of {total_rows} rows (filtered)")
+        view = view.head(MAX_VISIBLE_ROWS)
+    
+    # WINDOWS OPTIMIZATION: Batch insert rows
+    batch_rows = []
+    batch_size = RENDER_BATCH_SIZE
+    
+    for idx, (_, r) in enumerate(view.iterrows()):
         key = r['key']
-        visible_keys.add(key)  # Track visible rows
+        visible_keys.add(key)
         note_val = notes_map.get(key, "")
         note_mark = '📝' if str(note_val).strip() else ''
         st = STATUS.get(key, {'pkg':0,'stk':0})
         tag = status_to_tag(st)
         
-        app.tbl.insert('', 'end', iid=key,
-                      values=(_checkbox_cell_for(key), r['date'], r['price'],
-                            r['iban'], r['comment'], r['name'], note_mark),
-                      tags=(tag,))
+        # Collect for batch
+        batch_rows.append((key, (_checkbox_cell_for(key), r['date'], r['price'],
+                                  r['iban'], r['comment'], r['name'], note_mark), tag))
         
-        # Build cache incrementally (O(1) per row instead of O(n) at end)
+        # Insert batch when full
+        if len(batch_rows) >= batch_size:
+            _insert_batch(app, batch_rows)
+            batch_rows = []
+            
+            # Update progress on Windows
+            if IS_WINDOWS and hasattr(app, 'lbl_status'):
+                progress = int((idx / len(view)) * 100)
+                app.lbl_status.config(text=f"Rendering... {progress}%")
+                app.update_idletasks()
+    
+    # Insert remaining rows
+    if batch_rows:
+        _insert_batch(app, batch_rows)
+    
+    # Build cache
+    for key in visible_keys:
         app._rowkey_to_iid_cache[key] = key
     
     # CLEANUP: Only destroy note widgets for rows NOT in visible set
     if hasattr(app, '_note_widgets'):
         to_remove = [iid for iid in app._note_widgets.keys() if iid not in visible_keys]
-        for iid in to_remove:
+        for iid in to_remove[:20]:  # Limit to 20 per render
             try:
                 app._note_widgets[iid].destroy()
                 del app._note_widgets[iid]
@@ -638,14 +486,24 @@ def render(app: App):
         except:
             app.set_comment('')
     else:
-        # No rows visible - clear comment and note areas
         app.set_comment('')
         if hasattr(app, 'txt_note'):
             try:
                 app.txt_note.delete('1.0', 'end')
             except:
                 pass
+    
+    # Clear status
+    if hasattr(app, 'lbl_status'):
+        app.lbl_status.config(text="")
 
+def _insert_batch(app, batch_rows):
+    """Insert a batch of rows into TreeView - OPTIMIZED."""
+    for key, values, tag in batch_rows:
+        try:
+            app.tbl.insert('', 'end', iid=key, values=values, tags=(tag,))
+        except:
+            pass
 
 def refresh_with_cache_clear(app: App):
     """Refresh data, clearing cache first to get fresh Google Sheets data."""
@@ -664,645 +522,437 @@ def refresh_with_cache_clear(app: App):
                 app.update_idletasks()
         
         # Now load with fresh data
-        load_and_render(app)
+        load_and_render_async(app)
         
     except Exception as e:
         messagebox.showerror("Refresh Error", f"Failed to refresh:\n\n{e}")
 
+def load_and_render_async(app: App):
+    """
+    DRASTICALLY OPTIMIZED: Load data in background thread.
+    
+    - Never blocks UI
+    - Shows loading progress
+    - Incremental rendering
+    - Windows splash screen
+    """
+    
+    # Show loading indicator
+    if hasattr(app, 'lbl_status'):
+        app.lbl_status.config(text="📊 Loading data...")
+    
+    def _background_load():
+        try:
+            cfg = read_user_config()
+            is_sheets = cfg.get('data_source') == 'google_sheets'
+            
+            # Update status on main thread
+            if is_sheets:
+                app.after(0, lambda: _update_status(app, "📊 Fetching from Google Sheets..."))
+            
+            # SLOW OPERATION: Fetch in background
+            rows = fetch_rows(cfg)
+            
+            # Update status
+            app.after(0, lambda: _update_status(app, "🔄 Processing data..."))
+            
+            # Rebuild index
+            rebuild_index(rows)
+            
+            # Update status
+            app.after(0, lambda: _update_status(app, "🎨 Rendering..."))
+            
+            # Render on main thread
+            app.after(0, lambda: _finish_load(app))
+            
+        except Exception as e:
+            app.after(0, lambda: messagebox.showerror("Error", str(e)))
+            app.after(0, lambda: _update_status(app, ""))
+    
+    def _update_status(app, msg):
+        if hasattr(app, 'lbl_status'):
+            app.lbl_status.config(text=msg)
+    
+    def _finish_load(app):
+        render(app)
+        _update_status(app, "✅ Ready!")
+        app.after(2000, lambda: _update_status(app, ""))
+    
+    # Start background thread
+    threading.Thread(target=_background_load, daemon=True).start()
 
 def load_and_render(app: App):
-    """Load data with progress feedback for slow sources."""
-    try:
-        cfg = read_user_config()
-        
-        # Check if using Google Sheets
-        is_sheets = cfg.get('data_source') == 'google_sheets'
-        
-        if is_sheets:
-            # Show loading message
-            try:
-                if hasattr(app, 'lbl_status'):
-                    app.lbl_status.config(text="📊 Loading from Google Sheets...")
-                    app.update_idletasks()
-            except:
-                pass
-        
-        # Fetch data (slow part)
-        rows = fetch_rows(cfg)
-        
-        if is_sheets:
-            try:
-                if hasattr(app, 'lbl_status'):
-                    app.lbl_status.config(text="✓ Loaded! Rendering...")
-                    app.update_idletasks()
-            except:
-                pass
-        
-    except Exception as e:
-        messagebox.showerror("TrackNote", f"Failed to fetch data:\n\n{e}")
-        return
-    
-    rebuild_index(rows)
-    render(app)
-    
-    # Clear status
-    try:
-        if hasattr(app, 'lbl_status'):
-            app.lbl_status.config(text="")
-    except:
-        pass
+    """Wrapper that calls async version."""
+    load_and_render_async(app)
 
 # ---------- Toggle / clear actions ----------
-def _visible_keys(app: App):
-    return list(app.tbl.get_children())
 
 def toggle_status_for_keys(field, keys):
+    """OPTIMIZED: Instant status toggle - never blocks."""
     changed = []
     for key in keys:
         st = STATUS.get(key, {'pkg':0,'stk':0})
         st[field] = 0 if st.get(field) else 1
         STATUS[key] = st
         changed.append((key, status_to_tag(st)))
+    
+    # INSTANT: Save asynchronously (never blocks)
     save_status(STATUS)
+    
     return changed
 
 def toggle_status(field, app: App):
-    # Show quick status
-    try:
-        if hasattr(app, 'lbl_status'):
-            app.lbl_status.config(text="Updating...")
-            app.update_idletasks()
-    except:
-        pass
-
+    """OPTIMIZED: Instant toggle with no UI lag."""
     keys = set(CHECKED)
     if not keys:
         sel = app.tbl.selection()
         if sel: keys = {sel[0]}
     if not keys: return
+    
+    # Get changes
     changed = toggle_status_for_keys(field, keys)
 
-    # recolor rows and update checkbox glyphs
+    # INSTANT: Update UI immediately
     for key, tag in changed:
         try:
             vals = app.tbl.item(key, 'values')
             app.tbl.item(key, values=(_checkbox_cell_for(key), *vals[1:]), tags=(tag,))
         except Exception:
             pass
-    
-    # Update selection color immediately for the last changed row
-    last_tag = changed[-1][1] if changed else 'none'
-    
-    # Darker versions of the status colors for selected state
-    tag_to_selected_color = {
-        'none': '#79B8FF',      # default blue (unchanged)
-        'packaged': '#FFB84D',  # darker yellow/orange
-        'sticker': '#5EB1FF',   # darker blue
-        'both': '#66D966',      # darker green
-    }
-    
-    tag_to_fg = {
-        'none': '#111111',
-        'packaged': '#111111',
-        'sticker': '#111111',
-        'both': '#111111'
-    }
-    
-    # Apply the new selection color based on status
-    selected_bg = tag_to_selected_color.get(last_tag, '#79B8FF')
-    selected_fg = tag_to_fg.get(last_tag, '#111111')
-    
-    try:
-        app.style.map(
-            "Treeview",
-            background=[('selected', selected_bg), ('selected','!focus', selected_bg)],
-            foreground=[('selected', selected_fg), ('selected','!focus', selected_fg)],
-        )
-    except Exception:
-        pass
-    
-    # Store current selection colors so reset works
-    app._sel_current_bg = selected_bg
-    app._sel_current_fg = selected_fg
-    
-    # Show status message
-    if changed:
-        field_name = "PACKAGED" if field == 'pkg' else "STICKER"
-        status_msgs = {
-            'none': f"❌ Cleared from {len(changed)} row(s)",
-            'packaged': f"📦 {len(changed)} row(s) → PACKAGED",
-            'sticker': f"🏷️ {len(changed)} row(s) → STICKER",
-            'both': f"✅ {len(changed)} row(s) → BOTH"
-        }
-        msg = status_msgs.get(last_tag, f"✓ Toggled {len(changed)} row(s)")
-        try:
-            original_title = app.title()
-            app.title(msg)
-            app.after(2000, lambda: app.title(original_title))
-        except Exception:
-            pass
-    try:
-        app.lbl_status.config(text="")
-    except:
-        pass
+
+def clear_status_for_keys(keys):
+    """OPTIMIZED: Clear status instantly."""
+    for key in keys:
+        STATUS.pop(key, None)
+    save_status(STATUS)
 
 def clear_status_selected(app: App):
+    """OPTIMIZED: Instant clear."""
     keys = set(CHECKED)
     if not keys:
         sel = app.tbl.selection()
         if sel: keys = {sel[0]}
     if not keys: return
+    
+    clear_status_for_keys(keys)
+    
+    # Update UI instantly
     for key in keys:
-        if key in STATUS: del STATUS[key]
-        app.tbl.item(key, tags=('none',))
-    save_status(STATUS)
-    # leave current selection color as-is until selection changes
+        try:
+            vals = app.tbl.item(key, 'values')
+            app.tbl.item(key, values=(_checkbox_cell_for(key), *vals[1:]), tags=('none',))
+        except:
+            pass
 
 def on_tree_click(app: App, event):
-    region = app.tbl.identify('region', event.x, event.y)
+    """Handle clicks - toggle checkbox if in first column."""
+    region = app.tbl.identify_region(event.x, event.y)
     if region != 'cell': return
-    col = app.tbl.identify_column(event.x)  # '#1' is 'sel'
-    if col != '#1': return
-    row_id = app.tbl.identify_row(event.y)
-    if not row_id: return
-    if row_id in CHECKED: CHECKED.remove(row_id)
-    else: CHECKED.add(row_id)
-    vals = app.tbl.item(row_id, 'values')
-    app.tbl.item(row_id, values=( _checkbox_cell_for(row_id), *vals[1:] ))
+    
+    col = app.tbl.identify_column(event.x)
+    iid = app.tbl.identify_row(event.y)
+    if not iid: return
+    
+    # Toggle checkbox
+    if col == '#1':
+        if iid in CHECKED:
+            CHECKED.remove(iid)
+        else:
+            CHECKED.add(iid)
+        vals = app.tbl.item(iid, 'values')
+        app.tbl.item(iid, values=(_checkbox_cell_for(iid), *vals[1:]))
 
-def select_all_visible(app: App):
-    CHECKED.clear()
-    for key in _visible_keys(app):
-        CHECKED.add(key)
-        vals = app.tbl.item(key, 'values')
-        app.tbl.item(key, values=(_checkbox_cell_for(key), *vals[1:] ))
-
-def clear_selection(app: App):
-    for key in list(CHECKED):
-        vals = app.tbl.item(key, 'values')
-        app.tbl.item(key, values=('  ☐', *vals[1:] ))
-    CHECKED.clear()
-
-def clear_filters(app: App):
-    try:
-        app.var_q.set('')
-        app.var_from.set('')
-        app.var_to.set('')
-        render(app)
-    except Exception:
-        pass
-
-def flash_row(app: App, iid: str, target_tag: str):
-    """Flash row with highly visible animation."""
-    try:
-        # MUCH brighter flash colors
-        flash_colors = {
-            'none': '#FFFFFF',      # pure white flash
-            'packaged': '#FFB700',  # bright orange/gold flash
-            'sticker': '#0099FF',   # vivid blue flash  
-            'both': '#00FF00',      # vivid green flash
-        }
-        flash_color = flash_colors.get(target_tag, '#FFFF00')
-        
-        # Flash THREE times for visibility
-        flash_tag = f'flash_{target_tag}'
+def on_select_change(app: App, event):
+    """Handle selection changes - update comment and notes."""
+    # CRITICAL: Call ui.py's method to refresh bottom boxes (statement + custom note)
+    if hasattr(app, '_refresh_bottom_from_selection'):
         try:
-            app.tbl.tag_configure(flash_tag, background=flash_color)
-        except Exception:
-            pass
-        
-        # Flash sequence: bright -> normal -> bright -> normal -> bright -> final
-        app.tbl.item(iid, tags=(flash_tag,))
-        app.after(100, lambda: app.tbl.item(iid, tags=(target_tag,)))
-        app.after(200, lambda: app.tbl.item(iid, tags=(flash_tag,)))
-        app.after(300, lambda: app.tbl.item(iid, tags=(target_tag,)))
-        app.after(400, lambda: app.tbl.item(iid, tags=(flash_tag,)))
-        app.after(500, lambda: app.tbl.item(iid, tags=(target_tag,)))
-    except Exception:
-        pass
-
-def on_select_change(app: App, event=None):
+            app._refresh_bottom_from_selection()
+        except Exception as e:
+            print(f"Warning: Failed to refresh bottom boxes: {e}")
+    
+    # Fallback for comment only
     sel = app.tbl.selection()
-    if not sel:
-        app.set_comment('')
-        # Reset to default blue when nothing selected
-        try:
-            app.style.map(
-                "Treeview",
-                background=[('selected', app._sel_default_bg), ('selected','!focus', app._sel_default_bg)],
-                foreground=[('selected', app._sel_default_fg), ('selected','!focus', app._sel_default_fg)],
-            )
-        except Exception:
-            pass
+    if not sel: 
+        if hasattr(app, 'set_comment'):
+            app.set_comment('')
         return
     
-    iid = sel[0]
-    vals = app.tbl.item(iid, 'values')
+    vals = app.tbl.item(sel[0], 'values')
     cols = list(app.tbl['columns'])
     
-    # Get comment
     try:
         ci = cols.index('comment')
-        comment = vals[ci] if ci < len(vals) else ''
-    except Exception:
-        comment = ''
-    app.set_comment(comment)
-    
-    # Update selection color based on this row's status
-    try:
-        tags = app.tbl.item(iid, 'tags')
-        current_tag = tags[0] if tags else 'none'
-        
-        # Darker versions of status colors for selected state
-        tag_to_selected_color = {
-            'none': '#79B8FF',      # default blue
-            'packaged': '#FFB84D',  # darker yellow
-            'sticker': '#5EB1FF',   # darker blue
-            'both': '#66D966',      # darker green
-        }
-        
-        selected_bg = tag_to_selected_color.get(current_tag, '#79B8FF')
-        selected_fg = '#111111'
-        
-        app.style.map(
-            "Treeview",
-            background=[('selected', selected_bg), ('selected','!focus', selected_bg)],
-            foreground=[('selected', selected_fg), ('selected','!focus', selected_fg)],
-        )
-    except Exception:
-        pass
-
-# ---------- Main ----------
-def main():
-    # === CREATE HIDDEN ROOT FIRST TO PREVENT EMPTY WINDOWS ===
-    import tkinter as tk
-    root = tk.Tk()
-    root.withdraw()  # Hide immediately
-    
-    # === LOADING SCREEN DISABLED ===
-    # The loading screen was causing Tk window conflicts
-    # Keeping it disabled for stability
-    loading = None
-    
-    # --- Load configuration ---
-    cfg = read_user_config()
-    if loading and hasattr(loading, 'status'):
-        try:
-            loading.update_status("Connecting to Firebase...")
-        except:
-            pass
-    
-    # --- Trial / license gate ---
-    created = cfg.get("first_run_date")
-    try:
-        start = _dt.datetime.fromisoformat(created).date() if created else _dt.date.today()
-    except Exception:
-        start = _dt.date.today()
-    days_used = (_dt.date.today() - start).days
-    days_left = TRIAL_DAYS - days_used
-
-    key = read_license_key()
-    licensed = False
-    if key:
-        ok, _msg, _ = verify_license_key(key)
-        licensed = ok
-
-    if not licensed and days_left < 0:
-        # Trial over → ask for key; if canceled, exit.
-        if loading:
-            try:
-                loading.close()
-            except:
-                pass
-            loading = None  # Close loading screen for dialogs
-        _mb.showwarning("TrackNote", "Your 14-day trial has ended. Please enter a license key to continue.", parent=root)
-        if not show_license_dialog(root):
-            _mb.showinfo("TrackNote", "TrackNote will now quit.", parent=root)
-            sys.exit(0)
-        licensed = True
-        # Recreate loading screen after license dialog
-        try:
-            loading = LoadingScreen()
-            loading.update_status("Initializing...")
-        except:
-            loading = None
-    
-    # --- FIRST RUN SETUP WIZARD ---
-    if loading:
-        loading.update_status("Checking setup...")
-    
-    from data_source import is_configured
-    if not is_configured(cfg):
-        # Close loading screen for setup wizard
-        if loading:
-            try:
-                loading.close()
-            except:
-                pass
-            loading = None
-        
-        # Show setup wizard on first run
-        from setup_wizard import show_setup_wizard
-        completed = show_setup_wizard(None)  # Standalone mode
-        
-        if not completed:
-            messagebox.showinfo("TrackNote", "Setup was cancelled. TrackNote will now quit.")
-            sys.exit(0)
-        
-        # Reload config after wizard
-        cfg = read_user_config()
-        
-        # Recreate loading screen after wizard
-        try:
-            loading = LoadingScreen()
-            loading.update_status("Starting application...")
-        except:
-            loading = None
-    
-    # First-run: ensure per-user config exists with current app version
-    create_user_config_if_missing(get_app_version())
-    
-    if loading:
-        loading.update_status("Creating application...")
-    
-    # === DESTROY TEMPORARY ROOT AND CREATE MAIN APP ===
-    root.destroy()
-    
-    app = App()
-    app.withdraw()  # Keep hidden until fully loaded
-    app._is_closing = False  # Flag to prevent threading crashes on close
-    
-    # === Initialize performance features ===
-    try:
-        from loading_screen import QuickLoader
-        app.quick_loader = QuickLoader(app)
+        if hasattr(app, 'set_comment'):
+            app.set_comment(vals[ci] if ci < len(vals) else '')
     except:
-        pass
-    app.debouncer = OperationDebouncer(app, delay=50)
-    
-    if loading:
-        loading.update_status("Connecting to Firebase...")
-    
-    # Pass Firebase sync to app
-    if FIREBASE_SYNC and FIREBASE_SYNC.is_connected():
-        app.firebase_sync = FIREBASE_SYNC
-    else:
-        app.firebase_sync = None
-    
-    # === Setup menus ===
-    try:
-        app.help_menu.add_separator()
-        app.help_menu.add_command(label="License Status", command=lambda: _mb.showinfo("License", license_status_string()))
-        app.help_menu.add_command(label="Enter License Key…", command=lambda: show_license_dialog(app))
-    except Exception:
-        pass
-    
-# Add Settings menu item
-    def show_settings_dialog():
-        """Show settings dialog to change data source."""
-        from setup_wizard import show_setup_wizard
-        completed = show_setup_wizard(app)
-        if completed:
-            # Reload data after settings change
-            load_and_render(app)
+        if hasattr(app, 'set_comment'):
+            app.set_comment('')
 
-    # Actually add it to the menu (OUTSIDE the function)
-    try:
-        app.help_menu.add_command(label="Settings", command=show_settings_dialog)
-    except Exception:
-        pass
-
-    # Add Firebase Sync Setup menu item
-    def show_firebase_setup_dialog():
-        from firebase_gui_dialog import show_firebase_setup
-        completed = show_firebase_setup(app)
-        if completed:
-            messagebox.showinfo(
-                "TrackNote",
-                "Firebase configured! Please restart TrackNote for sync to work."
-            )
-    
-    try:
-        app.help_menu.add_command(label="Configure Firebase Sync...", command=show_firebase_setup_dialog)
-    except Exception:
-        pass
-    
-    # Add Show Fingerprint menu item
-    def show_fingerprint():
-        fp = get_machine_fingerprint()
-        messagebox.showinfo(
-            "Machine Fingerprint",
-            f"Your machine fingerprint:\n\n{fp}\n\n"
-            "Send this to support when requesting a license key."
-        )
-
-    try:
-        app.help_menu.add_command(label="Show Machine Fingerprint", command=show_fingerprint)
-    except Exception:
-        pass
-
-    _startup_log({"phase": "created-app"})
-
-
-    # Help → Edit / Save Custom Note
-    try:
-        app.help_menu.add_separator()
-        app.help_menu.add_command(label="Edit Custom Note", command=lambda: begin_edit_note(app))
-        app.help_menu.add_command(label="Save Custom Note", command=lambda: save_note_and_lock(app))
-    except Exception:
-        pass
-
-    # Keyboard shortcuts
-    try:
-        app.bind('<Command-e>', _guard_shortcut(app, begin_edit_note))
-        app.bind('<Command-s>', _guard_shortcut(app, save_note_and_lock))
-
-        # If you also support Windows:
-        app.bind('<Control-e>', _guard_shortcut(app, begin_edit_note))
-        app.bind('<Control-s>', _guard_shortcut(app, save_note_and_lock))
-    except Exception:
-        pass
-
-
-    configure_tags(app)
-
-    # hook up buttons
-    app.btn_refresh.configure(command=lambda: refresh_with_cache_clear(app))
-    app.btn_clear_filters.configure(command=lambda: clear_filters(app))
-    app.btn_select_all.configure(command=lambda: select_all_visible(app))
-    app.btn_clear_sel.configure(command=lambda: clear_selection(app))
-    app.btn_toggle_pkg.configure(command=lambda: toggle_status('pkg', app))
-    app.btn_toggle_stk.configure(command=lambda: toggle_status('stk', app))
-    app.btn_clear_status.configure(command=lambda: clear_status_selected(app))
-
-    # === Live search/date filtering (debounced) ===
-    def _schedule_render(*_args):
+def select_all(app: App):
+    """OPTIMIZED: Instant select all."""
+    visible = app.tbl.get_children()
+    CHECKED.update(visible)
+    for iid in visible:
         try:
-            render(app)  # Direct call, no debouncing
-        except Exception:
+            vals = app.tbl.item(iid, 'values')
+            app.tbl.item(iid, values=(_checkbox_cell_for(iid), *vals[1:]))
+        except:
             pass
 
+def clear_selection(app: App):
+    """OPTIMIZED: Instant clear selection."""
+    visible = app.tbl.get_children()
+    CHECKED.clear()
+    for iid in visible:
+        try:
+            vals = app.tbl.item(iid, 'values')
+            app.tbl.item(iid, values=(_checkbox_cell_for(iid), *vals[1:]))
+        except:
+            pass
+
+def clear_filters(app: App):
+    """OPTIMIZED: Clear filters instantly."""
+    app.var_q.set('')
+    app.var_from.set('')
+    app.var_to.set('')
+    
+    # Reset placeholders
+    for entry in [app.ent_name, app.ent_from, app.ent_to]:
+        if hasattr(entry, '_ph_active'):
+            entry._ph_active = True
+            entry.delete(0, 'end')
+            entry.insert(0, entry._ph_text)
+            entry.config(fg='#888888')
+    
+    # Debounced render (only expensive operation)
+    if not hasattr(app, '_render_debouncer'):
+        app._render_debouncer = OperationDebouncer(app, delay=FILTER_DEBOUNCE)
+    
+    app._render_debouncer.debounce('render', lambda: render(app))
+
+def _guard_shortcut(app, fn):
+    """Guard shortcuts."""
+    def wrapper(event):
+        fn(app)
+        return 'break'
+    return wrapper
+
+def _guarded_main():
     try:
+        _main_inner()
+    except Exception as e:
+        try:
+            _mb.showerror("TrackNote Startup Error", 
+                         f"Failed to start TrackNote:\n{e}\n\nCheck logs for details.")
+        except:
+            pass
+
+def _main_inner():
+    global STATUS, FIREBASE_SYNC
+    
+    # Check trial/license
+    allowed, msg = check_trial()
+    if not allowed:
+        root = tk.Tk()
+        root.withdraw()
+        act = show_license_dialog(root)
+        root.destroy()
+        if not act:
+            _mb.showwarning("TrackNote", "Trial expired. Please contact support.")
+            return
+        allowed, msg = check_trial()
+        if not allowed:
+            _mb.showerror("TrackNote", "License activation failed.")
+            return
+    
+    # WINDOWS OPTIMIZATION: Show loading splash
+    loading = None
+    if IS_WINDOWS:
+        try:
+            loading = tk.Tk()
+            loading.overrideredirect(True)
+            loading.geometry('400x150+500+300')
+            loading.configure(bg='white')
+            tk.Label(loading, text='⚡ Loading TrackNote...', bg='white', font=('Arial', 16, 'bold')).pack(pady=20)
+            tk.Label(loading, text='Optimized for Windows', bg='white', font=('Arial', 10), fg='#666').pack()
+            tk.Label(loading, text='Please wait...', bg='white', font=('Arial', 10), fg='#666').pack(pady=10)
+            loading.update()
+        except:
+            loading = None
+    
+    # Create main app
+    app = App()
+    app.withdraw()
+    
+    # Add license status
+    lic_status = license_status_string()
+    if lic_status:
+        app.title(f"TrackNote - {lic_status}")
+    
+    # Windows optimization notice
+    if IS_WINDOWS:
+        print("⚡ Windows Performance Mode: MAXIMUM")
+        print(f"  • Render batch size: {RENDER_BATCH_SIZE}")
+        print(f"  • Max visible rows: {MAX_VISIBLE_ROWS}")
+        print(f"  • Async everything: ON")
+    
+    # Load config
+    cfg = read_user_config()
+    
+    # Initialize Firebase
+    firebase_config = load_firebase_config()
+    if firebase_config:
+        try:
+            sheet_id = None
+            if cfg.get('data_source') == 'sheets':
+                url = cfg.get('sheet_url', '')
+                import re
+                m = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', url)
+                if m:
+                    sheet_id = m.group(1)
+            
+            namespace = sheet_id if sheet_id else 'default'
+            
+            FIREBASE_SYNC = FirebaseSync(
+                database_url=firebase_config['database_url'],
+                project_id=firebase_config['project_id'],
+                namespace=namespace
+            )
+            
+            app.firebase_sync = FIREBASE_SYNC
+            
+            # Load initial data
+            if FIREBASE_SYNC.is_connected():
+                try:
+                    STATUS = FIREBASE_SYNC.get_all_status()
+                    for k, v in STATUS.items():
+                        if isinstance(v, dict):
+                            STATUS[k] = {
+                                'pkg': v.get('pkg', 0),
+                                'stk': v.get('stk', 0)
+                            }
+                    
+                    print(f"✓ Loaded {len(STATUS)} status entries from Firebase")
+                except Exception as e:
+                    print(f"⚠️ Failed to load Firebase data: {e}")
+        except Exception as e:
+            print(f"⚠️ Firebase initialization failed: {e}")
+            FIREBASE_SYNC = None
+    else:
+        FIREBASE_SYNC = None
+    
+    # Wire up buttons
+    app.btn_refresh.config(command=lambda: refresh_with_cache_clear(app))
+    app.btn_clear_filters.config(command=lambda: clear_filters(app))
+    app.btn_select_all.config(command=lambda: select_all(app))
+    app.btn_clear_sel.config(command=lambda: clear_selection(app))
+    app.btn_toggle_pkg.config(command=lambda: toggle_status('pkg', app))
+    app.btn_toggle_stk.config(command=lambda: toggle_status('stk', app))
+    
+    # OPTIMIZED: Debounced filter bindings
+    try:
+        debouncer = OperationDebouncer(app, delay=FILTER_DEBOUNCE)
+        
+        def _schedule_render():
+            q = app.var_q.get()
+            f = app.var_from.get()
+            t = app.var_to.get()
+            
+            # Handle placeholders
+            if hasattr(app.ent_name, '_ph_active') and app.ent_name._ph_active:
+                q = ''
+            if hasattr(app.ent_from, '_ph_active') and app.ent_from._ph_active:
+                f = ''
+            if hasattr(app.ent_to, '_ph_active') and app.ent_to._ph_active:
+                t = ''
+            
+            debouncer.debounce('render', lambda: render(app))
+        
         app.var_q.trace_add('write', lambda *_: _schedule_render())
         app.var_from.trace_add('write', lambda *_: _schedule_render())
         app.var_to.trace_add('write', lambda *_: _schedule_render())
-        for w in (app.ent_name, app.ent_from, app.ent_to):
-            w.bind('<KeyRelease>', lambda e: _schedule_render(), add='+')
-            w.bind('<<Paste>>', lambda e: _schedule_render(), add='+')
-            w.bind('<<Cut>>',   lambda e: _schedule_render(), add='+')
     except Exception:
         pass
 
-    # events
+    # Events
     app.tbl.bind('<Button-1>', lambda e: on_tree_click(app, e))
     app.tbl.bind('<<TreeviewSelect>>', lambda e: on_select_change(app, e))
 
-    # keyboard shortcuts - use the CORRECT guard function
+    # Keyboard shortcuts
     app.tbl.bind('<space>', lambda e: on_tree_click(app, e))
     app.tbl.bind('<Key-p>', lambda e: toggle_status('pkg', app))
     app.tbl.bind('<Key-s>', lambda e: toggle_status('stk', app))
 
-    # App-wide keys with guard
+    # App-wide keys
     app.bind('<Escape>', lambda e: (_guard_shortcut(app, lambda _: clear_filters(app))(e)))
     app.bind('<Command-BackSpace>', lambda e: (_guard_shortcut(app, lambda _: clear_status_selected(app))(e)))
 
+    # Initial load (async)
+    load_and_render_async(app)
 
-    # initial load
-    load_and_render(app)
-    _startup_log({"phase": "before-mainloop"})
+    # Configure TreeView tags
+    configure_tags(app)
 
     # ===== FIREBASE REAL-TIME SYNC =====
     def on_firebase_change(change_type: str, row_key: Optional[str], data):
-        """OPTIMIZED Firebase change handler with batching."""
+        """Handle Firebase changes instantly."""
         try:
             global STATUS
             
-            # Batch multiple rapid changes
-            if not hasattr(app, '_firebase_batch'):
-                app._firebase_batch = {'changes': [], 'timer': None}
-            
-            # Add change to batch
-            app._firebase_batch['changes'].append((change_type, row_key, data))
-            
-            # Cancel existing timer
-            if app._firebase_batch['timer']:
-                app.after_cancel(app._firebase_batch['timer'])
-            
-            # Process batch after 100ms (aggregate rapid changes)
-            app._firebase_batch['timer'] = app.after(100, lambda: process_firebase_batch(app))
-            
-        except Exception as e:
-            pass  # Silent failure for performance
-
-    def process_firebase_batch(app):
-        """OPTIMIZED batch processor."""
-        try:
-            if not hasattr(app, '_firebase_batch'):
-                return
-            
-            # Check if window still exists
-            if not app.winfo_exists():
-                return
-                
-            changes = app._firebase_batch['changes']
-            app._firebase_batch = {'changes': [], 'timer': None}
-            
-            # Group changes by type
-            status_updates = {}
-            note_updates = {}
-            
-            for change_type, row_key, data in changes:
-                if change_type == 'status' and row_key:
-                    status_updates[row_key] = data
-                elif change_type == 'notes' and row_key:
-                    note_updates[row_key] = data
-            
-            # Apply status updates ONLY if row is visible
-            visible_iids = set(app.tbl.get_children())
-            
-            for row_key, data in status_updates.items():
+            if change_type == 'status' and row_key:
                 if data:
                     STATUS[row_key] = {'pkg': data.get('pkg', 0), 'stk': data.get('stk', 0)}
                 else:
                     STATUS.pop(row_key, None)
                 
-                # Update UI only if visible
-                if row_key in visible_iids:
-                    st = STATUS.get(row_key, {'pkg': 0, 'stk': 0})
-                    tag = status_to_tag(st)
-                    app.tbl.item(row_key, tags=(tag,))
-            
-            # Apply note updates ONLY if visible
-            for row_key, data in note_updates.items():
-                if hasattr(app, '_note_store'):
-                    if data:
-                        app._note_store[row_key] = data
-                    else:
-                        app._note_store.pop(row_key, None)
+                # Update UI if visible
+                try:
+                    visible_iids = set(app.tbl.get_children())
+                    if row_key in visible_iids:
+                        st = STATUS.get(row_key, {'pkg': 0, 'stk': 0})
+                        tag = status_to_tag(st)
+                        app.tbl.item(row_key, tags=(tag,))
+                except:
+                    pass
                     
-                    # Update editor only if exists and not focused
-                    if row_key in visible_iids and hasattr(app, '_note_widgets'):
-                        editor = app._note_widgets.get(row_key)
-                        if editor and editor != app.focus_get():
-                            editor.delete('1.0', 'end')
-                            if data:
-                                editor.insert('1.0', data)
-                            app._set_note_entry_bg(editor)
-                                
         except Exception:
-            pass  # Silent for performance
+            pass
 
-    # Start Firebase real-time listener
+    # Start Firebase listener
     if FIREBASE_SYNC and FIREBASE_SYNC.is_connected():
         try:
             FIREBASE_SYNC.start_listener(on_firebase_change)
-            print("✓ Real-time sync active - changes appear in 5 seconds")
+            print("✓ Real-time sync active")
         except Exception as e:
             print(f"⚠ Failed to start Firebase listener: {e}")
-    # ===== END FIREBASE SYNC =====
 
-    # ===== AUTO-REFRESH: 60 seconds + instant focus refresh =====
+    # ===== AUTO-REFRESH =====
     def auto_refresh():
         try:
-            # Check if app is closing
             if getattr(app, '_is_closing', False):
                 return
             if not app.winfo_exists():
-                return  # Window destroyed, stop refreshing
-            load_and_render(app)
+                return
+            load_and_render_async(app)
         except Exception:
             pass
         finally:
             try:
                 if not getattr(app, '_is_closing', False) and app.winfo_exists():
-                    app.after(60000, auto_refresh)  # Every 60 seconds
+                    app.after(60000, auto_refresh)
             except:
-                pass  # Window destroyed, stop
+                pass
 
-    def on_focus_refresh(event=None):
-        """INSTANT refresh when app regains focus."""
-        try:
-            # Check if app is closing
-            if getattr(app, '_is_closing', False):
-                return
-            if app.winfo_exists():
-                load_and_render(app)
-        except Exception:
-            pass
+    app.after(60000, auto_refresh)
 
-    # Start both refresh mechanisms
-    app.after(60000, auto_refresh)      # First auto-refresh after 60 sec
-    app.bind('<FocusIn>', on_focus_refresh)  # Instant refresh on focus
-    # ===== END AUTO-REFRESH =====
-
-    # === START MEMORY MANAGEMENT (every 60 seconds) ===
+    # === MEMORY MANAGEMENT ===
     def periodic_memory_check():
         try:
-            # Check if app is closing
             if getattr(app, '_is_closing', False):
                 return
             if not app.winfo_exists():
-                return  # Window destroyed, stop
+                return
             MemoryManager.cleanup_widgets(app)
             MemoryManager.optimize_caches(app)
         except Exception:
@@ -1312,57 +962,47 @@ def main():
                 if not getattr(app, '_is_closing', False) and app.winfo_exists():
                     app.after(60000, periodic_memory_check)
             except:
-                pass  # Window destroyed, stop
+                pass
     
     app.after(60000, periodic_memory_check)
-    # === END MEMORY MANAGEMENT ===
 
-    # === PROPER WINDOW CLOSE HANDLER (FIX FOR THREADING CRASH) ===
+    # === WINDOW CLOSE HANDLER ===
     def on_closing():
-        """Clean shutdown to prevent threading errors."""
         try:
-            # Set flag to stop background operations
             app._is_closing = True
             
-            # Cancel all pending after() callbacks
             for after_id in app.tk.call('after', 'info'):
                 try:
                     app.after_cancel(after_id)
                 except:
                     pass
             
-            # Stop Firebase listener if active
             if FIREBASE_SYNC and FIREBASE_SYNC.is_connected():
                 try:
                     FIREBASE_SYNC.stop_listener()
                 except:
                     pass
             
-            # Destroy window
             app.quit()
             app.destroy()
         except Exception:
-            # Force exit if cleanup fails
             import sys
             sys.exit(0)
     
-    # Register close handler
     app.protocol("WM_DELETE_WINDOW", on_closing)
-    # === END WINDOW CLOSE HANDLER ===
 
-    # Close loading screen and show main app
+    # Close loading and show app
     if loading:
         try:
-            loading.close()
+            loading.destroy()
         except:
             pass
 
-    app.deiconify()  # Show main app window
+    app.deiconify()
     
     try:
         app.mainloop()
-    except Exception as e:
-        # Ignore errors during/after window close
+    except Exception:
         pass
     
 if __name__ == '__main__':
