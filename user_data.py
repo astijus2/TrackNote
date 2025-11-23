@@ -1,6 +1,6 @@
 import json, os, sys
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 
 PRODUCT_NAME = "TrackNote"
 
@@ -40,6 +40,33 @@ def save_notes(notes: Dict[str, str]) -> None:
         )
     except Exception:
         pass  # never crash UI on IO errors
+
+# ----- NEW: Uploaded Bank Statement Rows Store -----
+def _uploaded_rows_path() -> Path:
+    """Returns the path to the file storing uploaded statement rows."""
+    return user_data_dir() / "statement_uploads.json"
+
+def load_uploaded_rows() -> List[Tuple]:
+    """Loads and returns the list of rows from uploaded bank statements."""
+    p = _uploaded_rows_path()
+    if not p.exists():
+        return []
+    try:
+        # The data is saved as a list of lists, convert inner lists to tuples
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return [tuple(row) for row in data if isinstance(row, list)]
+    except Exception:
+        return []
+
+def save_uploaded_rows(rows: List[Tuple]) -> None:
+    """Saves the list of rows from bank statements to a persistent file."""
+    try:
+        _uploaded_rows_path().write_text(
+            json.dumps(rows or [], ensure_ascii=False, indent=2),
+            encoding="utf-8"
+        )
+    except Exception:
+        pass # Never crash the UI on I/O errors
 
 # ----- User config (copy of bundled config.json) -----
 def _user_config_path() -> Path:

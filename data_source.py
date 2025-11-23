@@ -238,7 +238,10 @@ def fetch_rows(cfg: dict) -> List[Tuple]:
         
         # Try cache first
         cached = get_cached_sheets(spreadsheet_id, tab_name)
-        if cached:
+        # --- THIS IS THE FIX ---
+        # The condition is now `is not None` so that an empty but valid cache (`[]`)
+        # does not prevent a fresh fetch. It will only return if the cache is valid and fresh.
+        if cached is not None:
             print(f"✓ Using cached Sheets data ({len(cached)} rows)")
             return cached
         
@@ -248,7 +251,6 @@ def fetch_rows(cfg: dict) -> List[Tuple]:
         
         # Save to cache
         save_sheets_cache(spreadsheet_id, tab_name, rows)
-        print(f"✓ Cached {len(rows)} rows from Sheets")
         
         return rows
     

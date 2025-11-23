@@ -3,6 +3,7 @@ import os, json, hashlib
 os.environ.setdefault("TK_SILENCE_DEPRECATION", "1")
 
 import tkinter as tk
+from tkinter import filedialog
 from pathlib import Path
 import pandas as pd
 from tkinter import messagebox
@@ -10,16 +11,18 @@ from tkinter import messagebox as _mb
 import time
 import threading
 import platform
+import re
 
-from parsing import split_details, normalize
+# Updated import to include the new parser and its errors
+from parsing import split_details, normalize, BankStatementParser, StatementParsingError
 from data_source import fetch_rows
 from sheets_cache import clear_cache
 from ui import App
 from firebase_sync import FirebaseSync, load_firebase_config
-from typing import Optional, Tuple, Dict
 
-# --- Licensing: fingerprint, Ed25519 verify, trial ---
+from typing import Optional, Tuple, Dict
 import base64, subprocess, uuid, datetime as _dt
+# --- Licensing: fingerprint, Ed25519 verify, trial ---
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.exceptions import InvalidSignature
 from tkinter import simpledialog as _sd
@@ -30,13 +33,11 @@ IS_WINDOWS = platform.system() == "Windows"
 
 # WINDOWS OPTIMIZATION: Aggressive performance settings
 if IS_WINDOWS:
-    # Larger batch sizes for Windows
-    RENDER_BATCH_SIZE = 100  # Render 100 rows at a time
-    SCROLL_DEBOUNCE = 50     # 50ms scroll debounce
-    FILTER_DEBOUNCE = 200    # 200ms filter debounce
-    MAX_VISIBLE_ROWS = 500   # Limit visible rows for performance
+    RENDER_BATCH_SIZE = 100
+    SCROLL_DEBOUNCE = 50
+    FILTER_DEBOUNCE = 200
+    MAX_VISIBLE_ROWS = 500
 else:
-    # Mac can handle more
     RENDER_BATCH_SIZE = 200
     SCROLL_DEBOUNCE = 0
     FILTER_DEBOUNCE = 150
@@ -61,43 +62,33 @@ class OperationDebouncer:
 class MemoryManager:
     @staticmethod
     def get_memory_usage():
-        """Get memory usage if psutil is available."""
         if PSUTIL_AVAILABLE:
             try:
+                import psutil
                 process = psutil.Process()
                 return process.memory_info().rss / 1024 / 1024
-            except:
-                return 0
+            except: return 0
         return 0
     
     @staticmethod
     def cleanup_widgets(app):
-        """Clean up unused widgets - OPTIMIZED."""
         cleaned = 0
         try:
             visible = set(app.tbl.get_children())
-            
-            # Clean note widgets for non-visible rows only
             if hasattr(app, '_note_widgets'):
                 to_remove = [iid for iid in app._note_widgets.keys() if iid not in visible]
-                # Limit cleanup to prevent UI freeze
-                for iid in to_remove[:10]:  # Max 10 at a time
+                for iid in to_remove[:10]:
                     try:
                         app._note_widgets[iid].destroy()
                         del app._note_widgets[iid]
                         cleaned += 1
-                    except:
-                        pass
-        except Exception:
-            pass
-        
+                    except: pass
+        except Exception: pass
         return cleaned
     
     @staticmethod
     def optimize_caches(app):
-        """Optimize internal caches - FASTER VERSION."""
-        MAX_CACHE_SIZE = 2000  # Increased from 1000
-        
+        MAX_CACHE_SIZE = 2000
         if hasattr(app, '_rowkey_to_iid_cache'):
             if len(app._rowkey_to_iid_cache) > MAX_CACHE_SIZE:
                 visible = set(app.tbl.get_children())
@@ -105,37 +96,25 @@ class MemoryManager:
 
 PRODUCT_NAME = "TrackNote"
 TRIAL_DAYS = 14
-
-# Replace this with YOUR public key (bytes) generated once; filler for now:
-PUBLIC_KEY_B64 = "61izrH-GRDcHS_mLjbxRJoZAFbJqFQbSEsYzB8euFCg"  # placeholder!
+PUBLIC_KEY_B64 = "61izrH-GRDcHS_mLjbxRJoZAFbJqFQbSEsYzB8euFCg"
 
 def _b64url_decode(s: str) -> bytes:
     s = s.replace("-", "+").replace("_", "/")
     pad = "=" * (-len(s) % 4)
     return base64.b64decode(s + pad)
 
-def _b64url_encode(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
-
 def get_machine_fingerprint() -> str:
     try:
         if platform.system() == "Darwin":
-            out = subprocess.check_output(
-                ["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"], text=True
-            )
+            out = subprocess.check_output(["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"], text=True)
             for line in out.splitlines():
                 if "IOPlatformUUID" in line:
                     fp = line.split("=")[1].strip().strip('"')
-                    if fp:
-                        return fp.lower()
+                    if fp: return fp.lower()
         elif platform.system() == "Windows":
-            out = subprocess.check_output(
-                ["reg", "query", r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"],
-                text=True
-            )
+            out = subprocess.check_output(["reg", "query", r"HKLM\SOFTWARE\Microsoft\Cryptography", "/v", "MachineGuid"], text=True)
             return out.split()[-1].lower()
-    except Exception:
-        pass
+    except Exception: pass
     mac = uuid.getnode()
     arch = platform.machine()
     return f"{mac:012x}-{arch}".lower()
@@ -143,42 +122,29 @@ def get_machine_fingerprint() -> str:
 def verify_license_key(license_key: str) -> Tuple[bool, str, Optional[Dict]]:
     try:
         payload_part, sig_part = license_key.strip().split(".", 1)
-    except ValueError:
-        return (False, "License format is invalid.", None)
-
+    except ValueError: return (False, "License format is invalid.", None)
     try:
         payload_bytes = _b64url_decode(payload_part)
         payload = json.loads(payload_bytes.decode("utf-8"))
-    except Exception:
-        return (False, "License payload cannot be decoded.", None)
-
+    except Exception: return (False, "License payload cannot be decoded.", None)
     try:
         pub = Ed25519PublicKey.from_public_bytes(_b64url_decode(PUBLIC_KEY_B64))
         pub.verify(_b64url_decode(sig_part), payload_bytes)
-    except (InvalidSignature, ValueError):
-        return (False, "License signature is invalid.", payload)
-    except Exception as e:
-        return (False, f"License verify error: {e}", payload)
-
+    except (InvalidSignature, ValueError): return (False, "License signature is invalid.", payload)
+    except Exception as e: return (False, f"License verify error: {e}", payload)
     fp_now = get_machine_fingerprint()
-    if payload.get("fp", "").lower() != fp_now.lower():
-        return (False, "License is for a different computer.", payload)
-    if payload.get("prod") != PRODUCT_NAME:
-        return (False, "License product mismatch.", payload)
+    if payload.get("fp", "").lower() != fp_now.lower(): return (False, "License is for a different computer.", payload)
+    if payload.get("prod") != PRODUCT_NAME: return (False, "License product mismatch.", payload)
     exp = payload.get("exp")
     try:
-        if exp and _dt.date.today() > _dt.date.fromisoformat(exp):
-            return (False, f"License expired on {exp}.", payload)
-    except Exception:
-        return (False, "License expiry is invalid.", payload)
-
+        if exp and _dt.date.today() > _dt.date.fromisoformat(exp): return (False, f"License expired on {exp}.", payload)
+    except Exception: return (False, "License expiry is invalid.", payload)
     return (True, "OK", payload)
 
 def show_license_dialog(app) -> bool:
     while True:
         key = _sd.askstring("Enter License Key", "Paste your TrackNote license key:", parent=app)
-        if key is None:
-            return False
+        if key is None: return False
         ok, msg, _pl = verify_license_key(key)
         if ok:
             store_license_key(key)
@@ -189,21 +155,17 @@ def show_license_dialog(app) -> bool:
 
 def license_status_string() -> str:
     key = read_license_key()
-    if not key:
-        return ""
+    if not key: return ""
     ok, msg, payload = verify_license_key(key)
-    if not ok:
-        return ""
+    if not ok: return ""
     exp_str = payload.get("exp") if payload else None
     if exp_str:
         try:
             exp_date = _dt.date.fromisoformat(exp_str)
             days_left = (exp_date - _dt.date.today()).days
-            if days_left <= 0:
-                return ""
+            if days_left <= 0: return ""
             return f"Licensed (expires {exp_str})"
-        except:
-            return "Licensed"
+        except: return "Licensed"
     return "Licensed"
 
 def check_trial():
@@ -213,120 +175,73 @@ def check_trial():
         cfg["first_run_date"] = _dt.datetime.now().isoformat()
         write_user_config(cfg)
         return (True, "Trial started")
-    
     key = read_license_key()
     if key:
         ok, msg, _pl = verify_license_key(key)
-        if ok:
-            return (True, "Licensed")
-    
+        if ok: return (True, "Licensed")
     try:
         first = _dt.datetime.fromisoformat(first_run)
         elapsed = (_dt.datetime.now() - first).days
         if elapsed < TRIAL_DAYS:
             remaining = TRIAL_DAYS - elapsed
             return (True, f"Trial: {remaining} days left")
-        else:
-            return (False, "Trial expired")
-    except Exception:
-        return (True, "Trial active")
+        else: return (False, "Trial expired")
+    except Exception: return (True, "Trial active")
 
-# ===== GLOBALS =====
-from user_data import user_data_dir
-APPDIR = user_data_dir()
-APPDIR.mkdir(parents=True, exist_ok=True)
-
+# ===== GLOBALS & APP STATE =====
 FIREBASE_SYNC: Optional[FirebaseSync] = None
-STATUS_FILE = APPDIR / "status.json"
+STATUS = {}
+_df = pd.DataFrame()
+# VIEW_MODE removed
 
-def load_status():
-    """Load status from Firebase or local file."""
-    if FIREBASE_SYNC and FIREBASE_SYNC.is_connected():
-        try:
-            return FIREBASE_SYNC.get_all_status()
-        except Exception as e:
-            print(f"Error loading from Firebase: {e}")
-    
-    # Fallback to local file
-    try: 
-        return json.loads(STATUS_FILE.read_text())
-    except Exception: 
-        return {}
-
-def save_status(obj):
-    """
-    OPTIMIZED: Save status asynchronously - NEVER BLOCKS UI.
-    
-    This function returns IMMEDIATELY. Saves happen in background.
-    """
-    # INSTANT: Save to Firebase in background (batched)
-    if FIREBASE_SYNC and FIREBASE_SYNC.is_connected():
-        try:
-            for key, val in obj.items():
-                # This returns immediately - batched internally
-                FIREBASE_SYNC.set_status(key, val.get('pkg', 0), val.get('stk', 0))
-        except Exception as e:
-            print(f"Error saving to Firebase: {e}")
-    
-    # BACKGROUND: Save to local file in thread (non-blocking)
-    def _save_local():
-        try: 
-            STATUS_FILE.write_text(json.dumps(obj, ensure_ascii=False, indent=2))
-        except Exception: 
-            pass
-    
-    threading.Thread(target=_save_local, daemon=True).start()
-
-STATUS = load_status()
-
-# ---------- Tag colors ----------
-TAGS = {
-    'none':     {'bg': '#ffffff'},
-    'packaged': {'bg': '#fff4b8'},  # pale yellow - ORIGINAL
-    'sticker':  {'bg': '#dcecff'},  # light blue - ORIGINAL
-    'both':     {'bg': '#d6f5d6'},  # light green - ORIGINAL
-}
-
+# ---------- Tag colors & Configuration ----------
+TAGS = {'none':{'bg':'#ffffff'},'packaged':{'bg':'#fff4b8'},'sticker':{'bg':'#dcecff'},'both':{'bg':'#d6f5d6'}}
 def status_to_tag(st: dict) -> str:
     p, s = st.get('pkg', 0), st.get('stk', 0)
-    if p and s:
-        return 'both'
-    if p:
-        return 'packaged'
-    if s:
-        return 'sticker'
+    if p and s: return 'both'
+    if p: return 'packaged'
+    if s: return 'sticker'
     return 'none'
 def configure_tags(app: App):
-    """Configure TreeView tags with original colors."""
     for name, spec in TAGS.items():
-        try: 
-            app.tbl.tag_configure(name, background=spec['bg'])
-        except Exception: 
-            pass
-    
-    # Flash tags for visual feedback
-    try: 
-        app.tbl.tag_configure('flash_none', background='#FFFFFF')
-        app.tbl.tag_configure('flash_packaged', background='#FFB700')
-        app.tbl.tag_configure('flash_sticker', background='#0099FF')
-        app.tbl.tag_configure('flash_both', background='#00FF00')
-    except Exception: 
-        pass
-
+        try: app.tbl.tag_configure(name, background=spec['bg'])
+        except Exception: pass
 
 # ---------- Checkbox selection state ----------
-CHECKED = set()  # set of row keys (iids) that are checked
+# ---------- Checkbox selection state ----------
+CHECKED = set()
+def _checkbox_cell_for(key): return '  ☑' if key in CHECKED else '  ☐'
 
-def _checkbox_core(key):
-    return '☑' if key in CHECKED else '☐'
+# ---------- Undo History ----------
+HISTORY = []
 
-def _checkbox_cell_for(key):
-    return f'  {_checkbox_core(key)}'
+def undo_last_action(app: App):
+    if not HISTORY: return
+    
+    last_action = HISTORY.pop()
+    if last_action['type'] == 'status':
+        data = last_action['data']
+        for key, old_status in data.items():
+            # Restore status
+            pkg, stk = old_status.get('pkg', 0), old_status.get('stk', 0)
+            STATUS[key] = old_status
+            FIREBASE_SYNC.set_status(key, pkg, stk)
+            
+            # Optimistic UI update
+            if app.tbl.exists(key):
+                new_tag = status_to_tag(old_status)
+                current_tags = list(app.tbl.item(key, "tags"))
+                for t in TAGS.keys():
+                    if t in current_tags: current_tags.remove(t)
+                current_tags.append(new_tag)
+                app.tbl.item(key, tags=tuple(current_tags))
+        
+        # Update selection style to match restored status
+        update_selection_style(app)
+        # app.lbl_status.config(text="↺ Undid last action")
+        # app.after(2000, lambda: app.lbl_status.config(text=""))
 
-def _visible_keys(app: App):
-    return list(app.tbl.get_children())
-
-# ---------- Rendering ----------
+# ---------- Data Handling & Parsing ----------
 def _parse_date_input(s: str):
     s = (s or '').strip()
     if not s: return None
@@ -335,427 +250,469 @@ def _parse_date_input(s: str):
 
 def _val(entry, var):
     try:
-        # ignore placeholder if present
-        if getattr(entry, "_ph_active", False):
-            return ""
-    except Exception:
-        pass
+        if getattr(entry, "_ph_active", False): return ""
+    except Exception: pass
     try: return var.get()
     except Exception: return ""
 
-def row_key_from_values(date, price, iban, comment, name) -> str:
-    # stable per-row key; include row data
-    raw = "|".join([date or "", price or "", iban or "", comment or "", name or ""])
-    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
+def _parse_price(value) -> float:
+    if value is None: return 0.0
+    if isinstance(value, (int, float)): return float(value)
+    try:
+        s = str(value).strip().replace('$', '').replace('€', '').replace('£', '').replace(',', '')
+        return float(s) if s else 0.0
+    except (ValueError, TypeError): return 0.0
 
-def rebuild_index(raw_rows):
-    global _df
-    recs = []
-    for row_no, date, price, details in raw_rows:
-        name, iban, comment = split_details(details)
-        try: rn = int(str(row_no).split('.')[0])
-        except Exception: rn = 0
-        key = row_key_from_values(str(date or ''), str(price or ''), iban, comment, name)
-        recs.append({
-            'date': '' if date is None else str(date),
-            'price': '' if price is None else str(price),
-            'name': name, 'iban': iban, 'comment': comment,
-            'row_no': rn, 'name_norm': normalize(name), 'key': key
-        })
-    _df = pd.DataFrame(recs)
-    if not _df.empty:
-        _df.sort_values(by=['row_no'], ascending=[False], inplace=True)
-    _df['date_obj'] = pd.to_datetime(_df['date'], errors='coerce').dt.date
+def _create_transaction_fingerprint(tx: dict) -> str:
+    try:
+        amount_float = _parse_price(tx.get('amount', 0.0))
+        standard_amount = f"{amount_float:.2f}"
+    except (ValueError, TypeError): standard_amount = "0.00"
+    raw_string = "|".join([str(tx.get('date', '')).strip(), str(tx.get('payer', '')).strip(), str(tx.get('details', '')).strip(), standard_amount])
+    return hashlib.sha1(raw_string.encode("utf-8")).hexdigest()
 
-# Dataframe initial
-_df = pd.DataFrame(columns=[
-    'date','price','name','iban','comment','row_no','name_norm','date_obj','key'
-])
-
+# ---------- Core Rendering Logic ----------
 def render(app: App):
-    """
-    DRASTICALLY OPTIMIZED render for Windows.
+    """Renders ALL data sorted by name."""
+    global _df, STATUS
     
-    - Batched row insertion (100 rows at a time)
-    - Limit visible rows (500 max)
-    - Incremental rendering with progress
-    - No blocking operations
-    """
-    # Get filters
-    q = normalize(_val(app.ent_name, app.var_q))
-    d_from = _parse_date_input(_val(app.ent_from, app.var_from))
-    d_to = _parse_date_input(_val(app.ent_to, app.var_to))
-    
-    # Fast filter
-    view = _df
-    if len(_df) > 0:
-        if d_from is not None or d_to is not None:
-            date_mask = _df['date_obj'].notna()
-            if d_from is not None:
-                date_mask &= (_df['date_obj'] >= d_from)
-            if d_to is not None:
-                date_mask &= (_df['date_obj'] <= d_to)
-            view = view[date_mask]
-        
-        if q:
-            view = view[view['name_norm'].str.contains(q, na=False)]
-    
-    # Remember selection
-    current_sel = app.tbl.selection()
-    current_sel = current_sel[0] if current_sel else None
-    
-    # Clear table
     app.tbl.delete(*app.tbl.get_children())
     
-    from user_data import load_notes
-    notes_map = load_notes() or {}
-    
-    # Initialize or preserve cache
-    if not hasattr(app, '_rowkey_to_iid_cache'):
-        app._rowkey_to_iid_cache = {}
-    
-    # Collect visible row keys
-    visible_keys = set()
-    
-    # WINDOWS OPTIMIZATION: Limit visible rows
-    total_rows = len(view)
-    if IS_WINDOWS and total_rows > MAX_VISIBLE_ROWS:
-        # Show status
-        if hasattr(app, 'lbl_status'):
-            app.lbl_status.config(text=f"⚠️ Showing first {MAX_VISIBLE_ROWS} of {total_rows} rows (filtered)")
-        view = view.head(MAX_VISIBLE_ROWS)
-    
-    # WINDOWS OPTIMIZATION: Batch insert rows
-    batch_rows = []
-    batch_size = RENDER_BATCH_SIZE
-    
-    for idx, (_, r) in enumerate(view.iterrows()):
-        key = r['key']
-        visible_keys.add(key)
-        note_val = notes_map.get(key, "")
-        note_mark = '📝' if str(note_val).strip() else ''
-        st = STATUS.get(key, {'pkg':0,'stk':0})
-        tag = status_to_tag(st)
-        
-        # Collect for batch
-        batch_rows.append((key, (_checkbox_cell_for(key), r['date'], r['price'],
-                                  r['iban'], r['comment'], r['name'], note_mark), tag))
-        
-        # Insert batch when full
-        if len(batch_rows) >= batch_size:
-            _insert_batch(app, batch_rows)
-            batch_rows = []
-            
-            # Update progress on Windows
-            if IS_WINDOWS and hasattr(app, 'lbl_status'):
-                progress = int((idx / len(view)) * 100)
-                app.lbl_status.config(text=f"Rendering... {progress}%")
-                app.update_idletasks()
-    
-    # Insert remaining rows
-    if batch_rows:
-        _insert_batch(app, batch_rows)
-    
-    # Build cache
-    for key in visible_keys:
-        app._rowkey_to_iid_cache[key] = key
-    
-    # CLEANUP: Only destroy note widgets for rows NOT in visible set
-    if hasattr(app, '_note_widgets'):
-        to_remove = [iid for iid in app._note_widgets.keys() if iid not in visible_keys]
-        for iid in to_remove[:20]:  # Limit to 20 per render
-            try:
-                app._note_widgets[iid].destroy()
-                del app._note_widgets[iid]
-            except:
-                pass
-    
-    # Restore selection
-    kids = app.tbl.get_children()
-    target = current_sel if (current_sel in kids) else (kids[0] if kids else None)
-    if target:
-        app.tbl.selection_set(target)
-        app.tbl.focus(target)
-        
-        # Update comment
-        vals = app.tbl.item(target, 'values')
-        cols = list(app.tbl['columns'])
-        try:
-            ci = cols.index('comment')
-            app.set_comment(vals[ci] if ci < len(vals) else '')
-        except:
-            app.set_comment('')
-    else:
-        app.set_comment('')
-        if hasattr(app, 'txt_note'):
-            try:
-                app.txt_note.delete('1.0', 'end')
-            except:
-                pass
-    
-    # Clear status
-    if hasattr(app, 'lbl_status'):
-        app.lbl_status.config(text="")
+    if _df.empty:
+        app.lbl_view_info.config(text="No transactions found.")
+        return
 
-def _insert_batch(app, batch_rows):
-    """Insert a batch of rows into TreeView - OPTIMIZED."""
-    for key, values, tag in batch_rows:
-        try:
-            app.tbl.insert('', 'end', iid=key, values=values, tags=(tag,))
-        except:
-            pass
-
-def refresh_with_cache_clear(app: App):
-    """Refresh data, clearing cache first to get fresh Google Sheets data."""
-    try:
-        cfg = read_user_config()
-        is_sheets = cfg.get('data_source') == 'google_sheets'
+    # Update status tags
+    display_df = _df.copy()
+    display_df['status_tag'] = [status_to_tag(STATUS.get(idx, {})) for idx in display_df.index]
+    
+    # SIMPLIFIED LOGIC: Show ALL rows, sorted by Name then Date
+    app.lbl_view_info.config(text="Showing All People")
+    
+    # Sort by Name (normalized) then Date (descending)
+    view = display_df.sort_values(by=['name_norm', 'date'], ascending=[True, False])
+    
+    if not view.empty:
+        # FLAT LIST: No grouping, just list everyone sorted by name
+        # OPTIMIZATION: Batch insertion to prevent UI freeze
         
-        if is_sheets:
-            # Clear cache to force fresh data
-            clear_cache()
-            print("🔄 Cache cleared - fetching fresh data from Google Sheets...")
+        # Cancel any previous batch job
+        if hasattr(app, 'current_batch_job') and app.current_batch_job:
+            try: app.after_cancel(app.current_batch_job)
+            except: pass
+        app.current_batch_job = None
+        
+        # Convert to list of tuples for faster iteration
+        rows_to_insert = []
+        for key, r in view.iterrows():
+            values = (_checkbox_cell_for(key), r['date'], r['price'], r['iban'], r['comment'], r['name'], '')
+            tags = (r['status_tag'],)
+            rows_to_insert.append((key, values, tags))
             
-            # Show status
-            if hasattr(app, 'lbl_status'):
-                app.lbl_status.config(text="🔄 Refreshing from Google Sheets...")
-                app.update_idletasks()
+        total_rows = len(rows_to_insert)
+        batch_size = 50 # Tuned for smoother updates (was RENDER_BATCH_SIZE)
         
-        # Now load with fresh data
-        load_and_render_async(app)
-        
-    except Exception as e:
-        messagebox.showerror("Refresh Error", f"Failed to refresh:\n\n{e}")
+        def _insert_batch(start_idx):
+            if getattr(app, '_is_closing', False): return
+            
+            end_idx = min(start_idx + batch_size, total_rows)
+            for i in range(start_idx, end_idx):
+                key, values, tags = rows_to_insert[i]
+                app.tbl.insert('', 'end', iid=key, values=values, tags=tags)
+            
+            if end_idx < total_rows:
+                # Schedule next batch
+                app.current_batch_job = app.after(5, lambda: _insert_batch(end_idx))
+            else:
+                app.current_batch_job = None
+
+        # Start first batch immediately
+        _insert_batch(0)
 
 def load_and_render_async(app: App):
-    """
-    DRASTICALLY OPTIMIZED: Load data in background thread.
-    
-    - Never blocks UI
-    - Shows loading progress
-    - Incremental rendering
-    - Windows splash screen
-    """
-    
-    # Show loading indicator
-    if hasattr(app, 'lbl_status'):
-        app.lbl_status.config(text="📊 Loading data...")
+    """Loads all data from Firebase, performing a first-time import if needed."""
+    app.lbl_status.config(text="☁️ Syncing data from cloud...")
     
     def _background_load():
+        global _df, STATUS
         try:
-            cfg = read_user_config()
-            is_sheets = cfg.get('data_source') == 'google_sheets'
+            if not (FIREBASE_SYNC and FIREBASE_SYNC.is_connected()):
+                raise ConnectionError("Not connected to the sync service.")
             
-            # Update status on main thread
-            if is_sheets:
-                app.after(0, lambda: _update_status(app, "📊 Fetching from Google Sheets..."))
+            STATUS = FIREBASE_SYNC.get_all_status()
+            transactions_dict = FIREBASE_SYNC.get_all_transactions()
             
-            # SLOW OPERATION: Fetch in background
-            rows = fetch_rows(cfg)
+            if not transactions_dict:
+                app.after(0, lambda: app.lbl_status.config(text="☁️ Performing first-time import from source..."))
+                cfg = read_user_config()
+                initial_rows = fetch_rows(cfg)
+                
+                new_transactions_batch = {}
+                keys_in_this_import = set()
+                
+                for row_no, date, price, details in initial_rows:
+                    name, iban, comment = split_details(details)
+                    tx_like = {'date': str(date or ''), 'payer': name, 'details': comment, 'amount': price}
+                    fingerprint = _create_transaction_fingerprint(tx_like)
+                    
+                    if fingerprint in keys_in_this_import: continue
+                    keys_in_this_import.add(fingerprint)
+                    
+                    new_transactions_batch[fingerprint] = {
+                        'key': fingerprint, 'date': str(date or ''), 'price': _parse_price(price),
+                        'name': name, 'iban': iban, 'comment': comment,
+                        'row_no': 0, 'name_norm': normalize(name),
+                        'date_obj': pd.to_datetime(str(date), errors='coerce').date().isoformat() if date else None
+                    }
+                
+                if new_transactions_batch:
+                    FIREBASE_SYNC.set_transactions_batch(new_transactions_batch)
+                    transactions_dict = new_transactions_batch
             
-            # Update status
-            app.after(0, lambda: _update_status(app, "🔄 Processing data..."))
-            
-            # Rebuild index
-            rebuild_index(rows)
-            
-            # Update status
-            app.after(0, lambda: _update_status(app, "🎨 Rendering..."))
-            
-            # Render on main thread
+            if transactions_dict:
+                _df = pd.DataFrame.from_dict(transactions_dict, orient='index')
+                if 'key' not in _df.columns: _df['key'] = _df.index
+                _df.set_index('key', inplace=True, drop=False)
+            else:
+                _df = pd.DataFrame()
+
             app.after(0, lambda: _finish_load(app))
             
         except Exception as e:
-            app.after(0, lambda: messagebox.showerror("Error", str(e)))
-            app.after(0, lambda: _update_status(app, ""))
-    
-    def _update_status(app, msg):
-        if hasattr(app, 'lbl_status'):
-            app.lbl_status.config(text=msg)
+            app.after(0, lambda: messagebox.showerror("Sync Error", f"Could not load data from the cloud:\n{e}"))
+            app.after(0, lambda: app.lbl_status.config(text="Sync failed"))
     
     def _finish_load(app):
         render(app)
-        _update_status(app, "✅ Ready!")
-        app.after(2000, lambda: _update_status(app, ""))
+        app.lbl_status.config(text="✅ Synced")
+        app.after(2000, lambda: app.lbl_status.config(text=""))
     
-    # Start background thread
     threading.Thread(target=_background_load, daemon=True).start()
 
-def load_and_render(app: App):
-    """Wrapper that calls async version."""
-    load_and_render_async(app)
+def import_statement(app: App):
+    if not (FIREBASE_SYNC and FIREBASE_SYNC.is_connected()):
+        messagebox.showerror("Sync Error", "Cannot import: Not connected to the sync service.")
+        return
 
-# ---------- Toggle / clear actions ----------
+    filepath = filedialog.askopenfilename(title="Select Bank Statement", filetypes=(("Excel Files", "*.xlsx"), ("All files", "*.*")))
+    if not filepath: return
 
-def toggle_status_for_keys(field, keys):
-    """OPTIMIZED: Instant status toggle - never blocks."""
-    changed = []
-    for key in keys:
-        st = STATUS.get(key, {'pkg':0,'stk':0})
-        st[field] = 0 if st.get(field) else 1
-        STATUS[key] = st
-        changed.append((key, status_to_tag(st)))
-    
-    # INSTANT: Save asynchronously (never blocks)
-    save_status(STATUS)
-    
-    return changed
+    try:
+        parser = BankStatementParser()
+        parsed_transactions = parser.parse(filepath)
+        existing_keys = FIREBASE_SYNC.get_transaction_keys()
+        new_records_batch = {}
+        new_count, db_duplicate_count, file_duplicate_count = 0, 0, 0
+        keys_in_this_import = set()
+
+        for tx in parsed_transactions:
+            tx_for_hash = {'date': tx['date'], 'payer': tx['payer'], 'details': tx['details'], 'amount': tx['amount']}
+            fingerprint = _create_transaction_fingerprint(tx_for_hash)
+
+            if fingerprint in existing_keys or fingerprint in keys_in_this_import:
+                if fingerprint in existing_keys: db_duplicate_count += 1
+                else: file_duplicate_count += 1
+                continue
+
+            keys_in_this_import.add(fingerprint)
+            name, iban, comment = split_details(tx['payer'])
+            full_comment = f"{comment} | {tx['details']}".strip(" |") if tx['details'] else comment
+            
+            new_records_batch[fingerprint] = {
+                'key': fingerprint, 'date': tx['date'], 'price': _parse_price(tx['amount']),
+                'name': name, 'iban': iban, 'comment': full_comment,
+                'row_no': 0, 'name_norm': normalize(name),
+                'date_obj': pd.to_datetime(tx['date'], errors='coerce').date().isoformat()
+            }
+            new_count += 1
+
+        if new_records_batch:
+            FIREBASE_SYNC.set_transactions_batch(new_records_batch)
+
+        summary = (f"Import Complete!\n\n✅ New: {new_count}\n⏭️ Skipped (in DB): {db_duplicate_count}\n⏭️ Skipped (in file): {file_duplicate_count}")
+        messagebox.showinfo("Import Summary", summary)
+
+    except StatementParsingError as e: messagebox.showerror("Invalid Statement File", str(e))
+    except Exception as e: messagebox.showerror("Import Error", f"An unexpected error occurred: {e}")
+
+def prompt_for_workspace_id(app) -> Optional[str]:
+    while True:
+        ws_id = _sd.askstring("Cloud Sync Setup", "To sync data, create a unique Workspace ID.\n\nEnter the *exact same ID* on all your computers.\n\nWorkspace ID:", parent=app)
+        if ws_id is None: return None
+        if ws_id and not ws_id.isspace(): return ws_id.strip()
+        _mb.showwarning("Invalid ID", "Workspace ID cannot be empty. Please try again.", parent=app)
+
+def prompt_for_sheet_url(app) -> Optional[str]:
+    while True:
+        url = _sd.askstring("Google Sheets Setup", "Please paste the full URL of your Google Sheet.", parent=app)
+        if url is None: return None
+        if url and "spreadsheets/d/" in url: return url.strip()
+        _mb.showwarning("Invalid URL", "That does not look like a valid Google Sheet URL. Please try again.", parent=app)
+
+# ---------- UI Actions & Event Handlers ----------
+# toggle_view removed
+
 
 def toggle_status(field, app: App):
-    """OPTIMIZED: Instant toggle with no UI lag."""
     keys = set(CHECKED)
     if not keys:
         sel = app.tbl.selection()
-        if sel: keys = {sel[0]}
+        if sel: keys = {s for s in sel if not s.startswith('group_')}
     if not keys: return
     
-    # Get changes
-    changed = toggle_status_for_keys(field, keys)
-
-    # INSTANT: Update UI immediately
-    for key, tag in changed:
-        try:
-            vals = app.tbl.item(key, 'values')
-            app.tbl.item(key, values=(_checkbox_cell_for(key), *vals[1:]), tags=(tag,))
-        except Exception:
-            pass
-
-def clear_status_for_keys(keys):
-    """OPTIMIZED: Clear status instantly."""
+    # Save history
+    history_data = {}
     for key in keys:
-        STATUS.pop(key, None)
-    save_status(STATUS)
+        history_data[key] = STATUS.get(key, {'pkg': 0, 'stk': 0}).copy()
+    HISTORY.append({'type': 'status', 'data': history_data})
+    
+    for key in keys:
+        st = STATUS.get(key, {'pkg': 0, 'stk': 0})
+        st[field] = 0 if st.get(field) else 1
+        FIREBASE_SYNC.set_status(key, st.get('pkg', 0), st.get('stk', 0))
+        
+        # Optimistic UI update
+        if app.tbl.exists(key):
+            new_tag = status_to_tag(st)
+            current_tags = list(app.tbl.item(key, "tags"))
+            for t in TAGS.keys():
+                if t in current_tags: current_tags.remove(t)
+            current_tags.append(new_tag)
+            app.tbl.item(key, tags=tuple(current_tags))
+
+def context_toggle_status(field, app: App):
+    """Context menu action: Targets SELECTION only, ignores checkboxes."""
+    sel = app.tbl.selection()
+    keys = {s for s in sel if not s.startswith('group_')}
+    if not keys: return
+
+    for key in keys:
+        st = STATUS.get(key, {'pkg': 0, 'stk': 0})
+        # Force set to 1 (Mark) unless already set, then toggle? 
+        # User said "change to colour", implying "Make it Yellow". 
+        # But standard toggle behavior is usually expected. Let's stick to toggle for now.
+        st[field] = 0 if st.get(field) else 1
+        FIREBASE_SYNC.set_status(key, st.get('pkg', 0), st.get('stk', 0))
+        
+        # Optimistic UI update
+        if app.tbl.exists(key):
+            new_tag = status_to_tag(st)
+            current_tags = list(app.tbl.item(key, "tags"))
+            for t in TAGS.keys():
+                if t in current_tags: current_tags.remove(t)
+            current_tags.append(new_tag)
+            app.tbl.item(key, tags=tuple(current_tags))
+    
+    # Update selection style to match new status
+    update_selection_style(app)
+
+def context_toggle_status(field, app: App):
+    """Context menu action: Targets SELECTION only, ignores checkboxes."""
+    sel = app.tbl.selection()
+    keys = {s for s in sel if not s.startswith('group_')}
+    if not keys: return
+
+    # Save history
+    history_data = {}
+    for key in keys:
+        history_data[key] = STATUS.get(key, {'pkg': 0, 'stk': 0}).copy()
+    HISTORY.append({'type': 'status', 'data': history_data})
+
+    for key in keys:
+        st = STATUS.get(key, {'pkg': 0, 'stk': 0})
+        st[field] = 0 if st.get(field) else 1
+        FIREBASE_SYNC.set_status(key, st.get('pkg', 0), st.get('stk', 0))
+        
+        # Optimistic UI update
+        if app.tbl.exists(key):
+            new_tag = status_to_tag(st)
+            current_tags = list(app.tbl.item(key, "tags"))
+            for t in TAGS.keys():
+                if t in current_tags: current_tags.remove(t)
+            current_tags.append(new_tag)
+            app.tbl.item(key, tags=tuple(current_tags))
+    
+    # Update selection style to match new status
+    update_selection_style(app)
+
+def context_clear_status(app: App):
+    """Context menu action: Targets SELECTION only."""
+    sel = app.tbl.selection()
+    keys = {s for s in sel if not s.startswith('group_')}
+    if not keys: return
+    
+    # Save history
+    history_data = {}
+    for key in keys:
+        history_data[key] = STATUS.get(key, {'pkg': 0, 'stk': 0}).copy()
+    HISTORY.append({'type': 'status', 'data': history_data})
+    
+    for key in keys:
+        # Update global STATUS immediately
+        STATUS[key] = {'pkg': 0, 'stk': 0}
+        FIREBASE_SYNC.set_status(key, 0, 0)
+        # Optimistic UI update
+        if app.tbl.exists(key):
+            new_tag = 'none'
+            current_tags = list(app.tbl.item(key, "tags"))
+            for t in TAGS.keys():
+                if t in current_tags: current_tags.remove(t)
+            current_tags.append(new_tag)
+            app.tbl.item(key, tags=tuple(current_tags))
+            
+    # Update selection style to match new status
+    update_selection_style(app)
 
 def clear_status_selected(app: App):
-    """OPTIMIZED: Instant clear."""
     keys = set(CHECKED)
     if not keys:
         sel = app.tbl.selection()
-        if sel: keys = {sel[0]}
+        if sel: keys = {s for s in sel if not s.startswith('group_')}
     if not keys: return
     
-    clear_status_for_keys(keys)
-    
-    # Update UI instantly
+    # Save history
+    history_data = {}
     for key in keys:
-        try:
-            vals = app.tbl.item(key, 'values')
-            app.tbl.item(key, values=(_checkbox_cell_for(key), *vals[1:]), tags=('none',))
-        except:
-            pass
+        history_data[key] = STATUS.get(key, {'pkg': 0, 'stk': 0}).copy()
+    HISTORY.append({'type': 'status', 'data': history_data})
+    
+    for key in keys:
+        # Update global STATUS immediately so hidden rows are correct on re-render
+        STATUS[key] = {'pkg': 0, 'stk': 0}
+        FIREBASE_SYNC.set_status(key, 0, 0)
+        # Optimistic UI update
+        if app.tbl.exists(key):
+            # 0,0 means 'none' tag
+            new_tag = 'none'
+            current_tags = list(app.tbl.item(key, "tags"))
+            for t in TAGS.keys():
+                if t in current_tags: current_tags.remove(t)
+            current_tags.append(new_tag)
+            app.tbl.item(key, tags=tuple(current_tags))
+            
+    # Update selection style to match new status
+    update_selection_style(app)
 
 def on_tree_click(app: App, event):
-    """Handle clicks - toggle checkbox if in first column."""
-    region = app.tbl.identify_region(event.x, event.y)
-    if region != 'cell': return
-    
-    col = app.tbl.identify_column(event.x)
     iid = app.tbl.identify_row(event.y)
     if not iid: return
     
-    # Toggle checkbox
-    if col == '#1':
-        if iid in CHECKED:
-            CHECKED.remove(iid)
-        else:
-            CHECKED.add(iid)
+    # Group header check removed
+
+
+    if app.tbl.identify_region(event.x, event.y) == 'cell' and app.tbl.identify_column(event.x) == '#1':
+        if iid in CHECKED: CHECKED.remove(iid)
+        else: CHECKED.add(iid)
         vals = app.tbl.item(iid, 'values')
         app.tbl.item(iid, values=(_checkbox_cell_for(iid), *vals[1:]))
 
-def on_select_change(app: App, event):
-    """Handle selection changes - update comment and notes."""
-    # CRITICAL: Call ui.py's method to refresh bottom boxes (statement + custom note)
-    if hasattr(app, '_refresh_bottom_from_selection'):
-        try:
-            app._refresh_bottom_from_selection()
-        except Exception as e:
-            print(f"Warning: Failed to refresh bottom boxes: {e}")
-    
-    # Fallback for comment only
+def update_selection_style(app: App):
+    """Updates the Treeview selection color based on the status of selected rows."""
     sel = app.tbl.selection()
-    if not sel: 
-        if hasattr(app, 'set_comment'):
-            app.set_comment('')
+    keys = {s for s in sel if not s.startswith('group_')}
+    
+    if not keys:
+        # Default Grey
+        app.style.map("Treeview", background=[('selected', '#808080')], foreground=[('selected', 'white')])
         return
+
+    # Determine common status
+    statuses = [status_to_tag(STATUS.get(k, {})) for k in keys]
+    unique_statuses = set(statuses)
     
-    vals = app.tbl.item(sel[0], 'values')
-    cols = list(app.tbl['columns'])
+    bg_color = '#808080' # Default Grey
+    fg_color = 'white'
+    bd_color = '#555555' # Default Dark Grey Border
     
-    try:
-        ci = cols.index('comment')
-        if hasattr(app, 'set_comment'):
-            app.set_comment(vals[ci] if ci < len(vals) else '')
-    except:
-        if hasattr(app, 'set_comment'):
-            app.set_comment('')
+    if len(unique_statuses) == 1:
+        status = unique_statuses.pop()
+        if status == 'packaged': # Yellow
+            bg_color = '#e6dbaa' # Darker Yellow
+            fg_color = 'black'
+            bd_color = '#c4b88a' # Darker Yellow Border
+        elif status == 'sticker': # Blue
+            bg_color = '#b8d4f5' # Darker Blue
+            fg_color = 'black'
+            bd_color = '#98b4d5' # Darker Blue Border
+        elif status == 'both': # Green
+            bg_color = '#b8e6b8' # Darker Green
+            fg_color = 'black'
+            bd_color = '#98c698' # Darker Green Border
+            
+    app.style.map("Treeview", background=[('selected', bg_color)], foreground=[('selected', fg_color)])
+    # Enforce Black Border (Focus Ring) for all selections
+    app.style.map("Treeview", focuscolor=[('selected', 'black'), ('!selected', 'white')])
+
+def on_select_change(app: App, event):
+    update_selection_style(app)
+    if hasattr(app, '_refresh_bottom_from_selection'):
+        try: app._refresh_bottom_from_selection()
+        except Exception: pass
 
 def select_all(app: App):
-    """OPTIMIZED: Instant select all."""
-    visible = app.tbl.get_children()
-    CHECKED.update(visible)
-    for iid in visible:
-        try:
-            vals = app.tbl.item(iid, 'values')
-            app.tbl.item(iid, values=(_checkbox_cell_for(iid), *vals[1:]))
-        except:
-            pass
+    # Select all items (using DataFrame if available to ensure we get everything, even if not rendered)
+    global _df
+    if not _df.empty:
+        all_keys = _df.index.tolist()
+        CHECKED.update(all_keys)
+        # Update visible rows
+        for iid in app.tbl.get_children(''):
+            try:
+                vals = app.tbl.item(iid, 'values')
+                app.tbl.item(iid, values=(_checkbox_cell_for(iid), *vals[1:]))
+            except: pass
+    else:
+        # Fallback if _df is empty (shouldn't happen if there's data)
+        all_items = app.tbl.get_children('')
+        CHECKED.update(all_items)
+        for iid in all_items:
+            try:
+                vals = app.tbl.item(iid, 'values')
+                app.tbl.item(iid, values=(_checkbox_cell_for(iid), *vals[1:]))
+            except: pass
 
 def clear_selection(app: App):
-    """OPTIMIZED: Instant clear selection."""
-    visible = app.tbl.get_children()
+    all_items = app.tbl.get_children('')
+
     CHECKED.clear()
-    for iid in visible:
+    for iid in all_items:
         try:
             vals = app.tbl.item(iid, 'values')
             app.tbl.item(iid, values=(_checkbox_cell_for(iid), *vals[1:]))
-        except:
-            pass
+        except: pass
 
 def clear_filters(app: App):
-    """OPTIMIZED: Clear filters instantly."""
     app.var_q.set('')
     app.var_from.set('')
     app.var_to.set('')
-    
-    # Reset placeholders
     for entry in [app.ent_name, app.ent_from, app.ent_to]:
         if hasattr(entry, '_ph_active'):
             entry._ph_active = True
             entry.delete(0, 'end')
             entry.insert(0, entry._ph_text)
             entry.config(fg='#888888')
-    
-    # Debounced render (only expensive operation)
     if not hasattr(app, '_render_debouncer'):
         app._render_debouncer = OperationDebouncer(app, delay=FILTER_DEBOUNCE)
-    
     app._render_debouncer.debounce('render', lambda: render(app))
 
 def _guard_shortcut(app, fn):
-    """Guard shortcuts."""
     def wrapper(event):
         fn(app)
         return 'break'
     return wrapper
 
 def _guarded_main():
-    try:
-        _main_inner()
+    try: _main_inner()
     except Exception as e:
-        try:
-            _mb.showerror("TrackNote Startup Error", 
-                         f"Failed to start TrackNote:\n{e}\n\nCheck logs for details.")
-        except:
-            pass
+        try: _mb.showerror("TrackNote Startup Error", f"Failed to start TrackNote:\n{e}\n\nCheck logs for details.")
+        except: pass
 
 def _main_inner():
     global STATUS, FIREBASE_SYNC
     
-    # Check trial/license
     allowed, msg = check_trial()
     if not allowed:
-        root = tk.Tk()
-        root.withdraw()
+        root = tk.Tk(); root.withdraw()
         act = show_license_dialog(root)
         root.destroy()
         if not act:
@@ -766,244 +723,166 @@ def _main_inner():
             _mb.showerror("TrackNote", "License activation failed.")
             return
     
-    # WINDOWS OPTIMIZATION: Show loading splash
-    loading = None
-    if IS_WINDOWS:
-        try:
-            loading = tk.Tk()
-            loading.overrideredirect(True)
-            loading.geometry('400x150+500+300')
-            loading.configure(bg='white')
-            tk.Label(loading, text='⚡ Loading TrackNote...', bg='white', font=('Arial', 16, 'bold')).pack(pady=20)
-            tk.Label(loading, text='Optimized for Windows', bg='white', font=('Arial', 10), fg='#666').pack()
-            tk.Label(loading, text='Please wait...', bg='white', font=('Arial', 10), fg='#666').pack(pady=10)
-            loading.update()
-        except:
-            loading = None
-    
-    # Create main app
-    app = App()
-    app.withdraw()
-    
-    # Add license status
+    app = App(); app.withdraw()
     lic_status = license_status_string()
-    if lic_status:
-        app.title(f"TrackNote - {lic_status}")
+    if lic_status: app.title(f"TrackNote - {lic_status}")
     
-    # Windows optimization notice
-    if IS_WINDOWS:
-        print("⚡ Windows Performance Mode: MAXIMUM")
-        print(f"  • Render batch size: {RENDER_BATCH_SIZE}")
-        print(f"  • Max visible rows: {MAX_VISIBLE_ROWS}")
-        print(f"  • Async everything: ON")
-    
-    # Load config
     cfg = read_user_config()
     
-    # Initialize Firebase
+    namespace = None
+    if cfg.get('data_source') == 'google_sheets':
+        while True:
+            url = cfg.get('sheet_url', '')
+            match = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', url)
+            if match:
+                namespace = match.group(1)
+                break
+            new_url = prompt_for_sheet_url(app)
+            if new_url:
+                cfg['sheet_url'] = new_url
+                write_user_config(cfg)
+            else:
+                app.destroy()
+                return
+    else:
+        namespace = cfg.get('workspace_id')
+        if not namespace:
+            namespace = prompt_for_workspace_id(app)
+            if not namespace:
+                app.destroy()
+                return
+            cfg['workspace_id'] = namespace
+            write_user_config(cfg)
+    
     firebase_config = load_firebase_config()
     if firebase_config:
         try:
-            sheet_id = None
-            if cfg.get('data_source') == 'sheets':
-                url = cfg.get('sheet_url', '')
-                import re
-                m = re.search(r'/spreadsheets/d/([a-zA-Z0-9-_]+)', url)
-                if m:
-                    sheet_id = m.group(1)
-            
-            namespace = sheet_id if sheet_id else 'default'
-            
-            FIREBASE_SYNC = FirebaseSync(
-                database_url=firebase_config['database_url'],
-                project_id=firebase_config['project_id'],
-                namespace=namespace
-            )
-            
+            FIREBASE_SYNC = FirebaseSync(database_url=firebase_config['database_url'], project_id=firebase_config['project_id'], namespace=namespace)
             app.firebase_sync = FIREBASE_SYNC
-            
-            # Load initial data
-            if FIREBASE_SYNC.is_connected():
-                try:
-                    STATUS = FIREBASE_SYNC.get_all_status()
-                    for k, v in STATUS.items():
-                        if isinstance(v, dict):
-                            STATUS[k] = {
-                                'pkg': v.get('pkg', 0),
-                                'stk': v.get('stk', 0)
-                            }
-                    
-                    print(f"✓ Loaded {len(STATUS)} status entries from Firebase")
-                except Exception as e:
-                    print(f"⚠️ Failed to load Firebase data: {e}")
         except Exception as e:
             print(f"⚠️ Firebase initialization failed: {e}")
             FIREBASE_SYNC = None
-    else:
-        FIREBASE_SYNC = None
     
-    # Wire up buttons
-    app.btn_refresh.config(command=lambda: refresh_with_cache_clear(app))
+    # app.btn_toggle_view.config(command=lambda: toggle_view(app)) # Removed
+    app.btn_refresh.config(command=lambda: load_and_render_async(app))
+    app.btn_import.config(command=lambda: import_statement(app))
     app.btn_clear_filters.config(command=lambda: clear_filters(app))
     app.btn_select_all.config(command=lambda: select_all(app))
     app.btn_clear_sel.config(command=lambda: clear_selection(app))
     app.btn_toggle_pkg.config(command=lambda: toggle_status('pkg', app))
     app.btn_toggle_stk.config(command=lambda: toggle_status('stk', app))
+    app.btn_clear_status.config(command=lambda: clear_status_selected(app))
     
-    # OPTIMIZED: Debounced filter bindings
-    try:
-        debouncer = OperationDebouncer(app, delay=FILTER_DEBOUNCE)
-        
-        def _schedule_render():
-            q = app.var_q.get()
-            f = app.var_from.get()
-            t = app.var_to.get()
-            
-            # Handle placeholders
-            if hasattr(app.ent_name, '_ph_active') and app.ent_name._ph_active:
-                q = ''
-            if hasattr(app.ent_from, '_ph_active') and app.ent_from._ph_active:
-                f = ''
-            if hasattr(app.ent_to, '_ph_active') and app.ent_to._ph_active:
-                t = ''
-            
-            debouncer.debounce('render', lambda: render(app))
-        
-        app.var_q.trace_add('write', lambda *_: _schedule_render())
-        app.var_from.trace_add('write', lambda *_: _schedule_render())
-        app.var_to.trace_add('write', lambda *_: _schedule_render())
-    except Exception:
-        pass
+    app.realtime_render_debouncer = OperationDebouncer(app, delay=300)
 
-    # Events
+    debouncer = OperationDebouncer(app, delay=FILTER_DEBOUNCE)
+    def _schedule_render(*_): debouncer.debounce('render', lambda: render(app))
+    app.var_q.trace_add('write', _schedule_render)
+    app.var_from.trace_add('write', _schedule_render)
+    app.var_to.trace_add('write', _schedule_render)
+
     app.tbl.bind('<Button-1>', lambda e: on_tree_click(app, e))
     app.tbl.bind('<<TreeviewSelect>>', lambda e: on_select_change(app, e))
-
-    # Keyboard shortcuts
     app.tbl.bind('<space>', lambda e: on_tree_click(app, e))
     app.tbl.bind('<Key-p>', lambda e: toggle_status('pkg', app))
     app.tbl.bind('<Key-s>', lambda e: toggle_status('stk', app))
-
-    # App-wide keys
     app.bind('<Escape>', lambda e: (_guard_shortcut(app, lambda _: clear_filters(app))(e)))
     app.bind('<Command-BackSpace>', lambda e: (_guard_shortcut(app, lambda _: clear_status_selected(app))(e)))
+    
+    # --- Context Menu Bindings ---
+    def show_context_menu(event):
+        iid = app.tbl.identify_row(event.y)
+        if iid:
+            # Select the row under cursor if not already selected
+            if iid not in app.tbl.selection():
+                app.tbl.selection_set(iid)
+                # Also update CHECKED set to match selection for consistent behavior
+                # (Optional: depends if we want right-click to act on selection or just the row)
+                # For now, let's just ensure the row is selected so the action applies to it
+            
+            # Ensure CHECKED is updated to match selection if it's empty
+            # This allows right-click -> Action to work on the row under cursor
+            if not CHECKED:
+                CHECKED.add(iid)
+            
+            try: app.context_menu.tk_popup(event.x_root, event.y_root)
+            finally: app.context_menu.grab_release()
 
-    # Initial load (async)
+    if IS_WINDOWS:
+        app.tbl.bind("<Button-3>", show_context_menu)
+    else:
+        app.tbl.bind("<Button-2>", show_context_menu)
+        app.tbl.bind("<Button-3>", show_context_menu) # Support both on Mac just in case
+
+    app.bind("<<CtxTogglePkg>>", lambda e: context_toggle_status('pkg', app))
+    app.bind("<<CtxToggleStk>>", lambda e: context_toggle_status('stk', app))
+    app.bind("<<CtxClearStatus>>", lambda e: context_clear_status(app))
+    
+    # Undo binding
+    app.bind("<Control-z>", lambda e: undo_last_action(app))
+    app.bind("<Command-z>", lambda e: undo_last_action(app))
+
     load_and_render_async(app)
-
-    # Configure TreeView tags
     configure_tags(app)
 
-    # ===== FIREBASE REAL-TIME SYNC =====
-    def on_firebase_change(change_type: str, row_key: Optional[str], data):
-        """Handle Firebase changes instantly."""
-        try:
-            global STATUS
-            
-            if change_type == 'status' and row_key:
-                if data:
-                    STATUS[row_key] = {'pkg': data.get('pkg', 0), 'stk': data.get('stk', 0)}
-                else:
-                    STATUS.pop(row_key, None)
-                
-                # Update UI if visible
-                try:
-                    visible_iids = set(app.tbl.get_children())
-                    if row_key in visible_iids:
-                        st = STATUS.get(row_key, {'pkg': 0, 'stk': 0})
-                        tag = status_to_tag(st)
-                        app.tbl.item(row_key, tags=(tag,))
-                except:
-                    pass
-                    
-        except Exception:
-            pass
+    def on_firebase_change(change_type: str, key: Optional[str], data):
+        global STATUS, _df
+        if not key: return
 
-    # Start Firebase listener
+        needs_render = False
+        if change_type == 'status':
+            # Incremental update: Update data AND UI directly without full re-render
+            if data: STATUS[key] = data
+            else: STATUS.pop(key, None)
+            
+            # Direct UI update
+            if app.tbl.exists(key):
+                new_tag = status_to_tag(STATUS.get(key, {}))
+                # Preserve existing tags (like 'sel') if any, but usually we just set the status tag
+                # We need to keep 'group_header' if it was there, but keys are usually transactions
+                current_tags = list(app.tbl.item(key, "tags"))
+                # Remove old status tags
+                for t in TAGS.keys():
+                    if t in current_tags: current_tags.remove(t)
+                current_tags.append(new_tag)
+                app.tbl.item(key, tags=tuple(current_tags))
+            
+            # Do NOT trigger full render for status changes
+            needs_render = False
+        
+        elif change_type == 'transaction':
+            if data:
+                s = pd.Series(data, name=key)
+                if all(col in _df.columns for col in s.index):
+                    _df.loc[key] = s
+                else:
+                    new_row = pd.DataFrame([data], index=[key])
+                    _df = pd.concat([_df, new_row])
+            elif key in _df.index:
+                _df.drop(key, inplace=True)
+            needs_render = True
+        
+        if needs_render:
+            app.realtime_render_debouncer.debounce('render', lambda: render(app))
+
     if FIREBASE_SYNC and FIREBASE_SYNC.is_connected():
         try:
             FIREBASE_SYNC.start_listener(on_firebase_change)
-            print("✓ Real-time sync active")
-        except Exception as e:
-            print(f"⚠ Failed to start Firebase listener: {e}")
+            print("✓ Real-time sync active for all data")
+        except Exception as e: print(f"⚠ Failed to start Firebase listener: {e}")
 
-    # ===== AUTO-REFRESH =====
-    def auto_refresh():
-        try:
-            if getattr(app, '_is_closing', False):
-                return
-            if not app.winfo_exists():
-                return
-            load_and_render_async(app)
-        except Exception:
-            pass
-        finally:
-            try:
-                if not getattr(app, '_is_closing', False) and app.winfo_exists():
-                    app.after(60000, auto_refresh)
-            except:
-                pass
-
-    app.after(60000, auto_refresh)
-
-    # === MEMORY MANAGEMENT ===
-    def periodic_memory_check():
-        try:
-            if getattr(app, '_is_closing', False):
-                return
-            if not app.winfo_exists():
-                return
-            MemoryManager.cleanup_widgets(app)
-            MemoryManager.optimize_caches(app)
-        except Exception:
-            pass
-        finally:
-            try:
-                if not getattr(app, '_is_closing', False) and app.winfo_exists():
-                    app.after(60000, periodic_memory_check)
-            except:
-                pass
-    
-    app.after(60000, periodic_memory_check)
-
-    # === WINDOW CLOSE HANDLER ===
     def on_closing():
         try:
             app._is_closing = True
-            
-            for after_id in app.tk.call('after', 'info'):
-                try:
-                    app.after_cancel(after_id)
-                except:
-                    pass
-            
-            if FIREBASE_SYNC and FIREBASE_SYNC.is_connected():
-                try:
-                    FIREBASE_SYNC.stop_listener()
-                except:
-                    pass
-            
-            app.quit()
-            app.destroy()
+            for after_id in app.tk.call('after', 'info'): app.after_cancel(after_id)
+            if FIREBASE_SYNC and FIREBASE_SYNC.is_connected(): FIREBASE_SYNC.stop_listener()
+            app.quit(); app.destroy()
         except Exception:
-            import sys
-            sys.exit(0)
-    
+            import sys; sys.exit(0)
     app.protocol("WM_DELETE_WINDOW", on_closing)
 
-    # Close loading and show app
-    if loading:
-        try:
-            loading.destroy()
-        except:
-            pass
-
     app.deiconify()
-    
-    try:
-        app.mainloop()
-    except Exception:
-        pass
-    
+    app.mainloop()
+
 if __name__ == '__main__':
     _guarded_main()
