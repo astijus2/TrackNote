@@ -9,7 +9,6 @@ env/
 # Build artifacts
 build/
 dist/
-*.spec
 
 # macOS
 .DS_Store
@@ -17,6 +16,13 @@ dist/
 # Sensitive files
 firebase_config.json
 credentials/
+private.key
+public.key
+
+# Backup/temporary files
+*.save
+*.bak
+*~
 
 # IDE
 .vscode/

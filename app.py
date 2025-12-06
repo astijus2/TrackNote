@@ -539,32 +539,6 @@ def context_toggle_status(field, app: App):
     keys = {s for s in sel if not s.startswith('group_')}
     if not keys: return
 
-    for key in keys:
-        st = STATUS.get(key, {'pkg': 0, 'stk': 0})
-        # Force set to 1 (Mark) unless already set, then toggle? 
-        # User said "change to colour", implying "Make it Yellow". 
-        # But standard toggle behavior is usually expected. Let's stick to toggle for now.
-        st[field] = 0 if st.get(field) else 1
-        FIREBASE_SYNC.set_status(key, st.get('pkg', 0), st.get('stk', 0))
-        
-        # Optimistic UI update
-        if app.tbl.exists(key):
-            new_tag = status_to_tag(st)
-            current_tags = list(app.tbl.item(key, "tags"))
-            for t in TAGS.keys():
-                if t in current_tags: current_tags.remove(t)
-            current_tags.append(new_tag)
-            app.tbl.item(key, tags=tuple(current_tags))
-    
-    # Update selection style to match new status
-    update_selection_style(app)
-
-def context_toggle_status(field, app: App):
-    """Context menu action: Targets SELECTION only, ignores checkboxes."""
-    sel = app.tbl.selection()
-    keys = {s for s in sel if not s.startswith('group_')}
-    if not keys: return
-
     # Save history
     history_data = {}
     for key in keys:
