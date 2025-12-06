@@ -240,30 +240,97 @@ class FirebaseSync:
         self._listener_thread.start()
     
     def _poll_changes(self):
-        """Background thread that polls for all data changes."""
-        last_data = {}
-        poll_interval = 5
-        
+        """Background thread that STREAMS data changes (SSE) for instant updates."""
         while self._listener_running:
             try:
+                # Use Streaming (Server-Sent Events) for instant updates
                 url = f"{self.database_url}/tracknote/{self.namespace}.json"
-                current_data = requests.get(url, timeout=10).json() or {}
+                headers = {'Accept': 'text/event-stream'}
                 
-                for category in ['status', 'notes', 'transactions']:
-                    last_cat_data = last_data.get(category, {})
-                    current_cat_data = current_data.get(category, {})
+                with requests.get(url, headers=headers, stream=True, timeout=60) as response:
+                    if response.status_code != 200:
+                        raise Exception(f"Stream failed: {response.status_code}")
                     
-                    if current_cat_data != last_cat_data:
-                        all_keys = set(current_cat_data.keys()) | set(last_cat_data.keys())
-                        for key in all_keys:
-                            old, new = last_cat_data.get(key), current_cat_data.get(key)
-                            if old != new:
-                                change_type = 'transaction' if category == 'transactions' else category
-                                self._on_change_callback(change_type, key, new)
-                
-                last_data = current_data.copy()
-            except Exception: pass
-            time.sleep(poll_interval)
+                    for line in response.iter_lines():
+                        if not self._listener_running: break
+                        if not line: continue
+                        
+                        decoded_line = line.decode('utf-8')
+                        
+                        # Parse SSE event
+                        if decoded_line.startswith('event: '):
+                            event_type = decoded_line[7:].strip()
+                            continue # Wait for data line
+                            
+                        if decoded_line.startswith('data: '):
+                            try:
+                                data_str = decoded_line[6:]
+                                if not data_str or data_str == 'null': continue
+                                
+                                event_data = json.loads(data_str)
+                                path = event_data.get('path', '/')
+                                data = event_data.get('data')
+                                
+                                # Handle Keep-Alive or nulls
+                                if not path or data is None: continue
+                                
+                                # Parse path to determine category and key
+                                # Path examples: "/", "/status", "/status/key123", "/status/key123/pkg"
+                                parts = path.strip('/').split('/')
+                                
+                                if not parts or parts == ['']:
+                                    # Full update (rare in stream, usually initial)
+                                    # We can ignore or handle, but usually we care about granular updates
+                                    pass
+                                    
+                                elif parts[0] in ['status', 'notes', 'transactions']:
+                                    category = parts[0]
+                                    change_type = 'transaction' if category == 'transactions' else category
+                                    
+                                    if len(parts) == 2:
+                                        # /status/key123 -> Update entire object for key
+                                        key = parts[1]
+                                        self._on_change_callback(change_type, key, data)
+                                        
+                                    elif len(parts) > 2:
+                                        # /status/key123/pkg -> Partial update
+                                        # We need to fetch the full object or patch it?
+                                        # For simplicity, if it's a partial update, we might just pass the partial data
+                                        # But app expects full object.
+                                        # Optimization: Just pass the key and let app handle or construct object?
+                                        # Actually, for 'pkg'/'stk', we can construct it if we have cache.
+                                        key = parts[1]
+                                        field = parts[2]
+                                        
+                                        if category == 'status':
+                                            # Update cache
+                                            current = self._status_cache.get(key, {'pkg': 0, 'stk': 0})
+                                            current[field] = data
+                                            self._status_cache[key] = current
+                                            self._on_change_callback(change_type, key, current)
+                                            
+                                        elif category == 'notes':
+                                            # /notes/key/text -> data is text
+                                            # But notes structure is {text: "...", updated_at: ...}
+                                            # If path is /notes/key/text, data is the string.
+                                            # If path is /notes/key, data is the dict.
+                                            if field == 'text':
+                                                self._on_change_callback(change_type, key, data)
+                                            elif field == 'updated_at':
+                                                pass # Ignore timestamp only updates
+                                                
+                                    elif len(parts) == 1:
+                                        # /status -> Bulk update for category
+                                        if isinstance(data, dict):
+                                            for k, v in data.items():
+                                                self._on_change_callback(change_type, k, v)
+                                                
+                            except Exception as e:
+                                print(f"SSE Parse Error: {e}")
+                                
+            except Exception as e:
+                # print(f"Stream disconnected: {e}, reconnecting...")
+                time.sleep(1) # Backoff before reconnect
     
     def stop_listener(self):
         """Stop the polling thread."""

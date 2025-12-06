@@ -132,6 +132,8 @@ class BankStatementParser:
         try:
             cleaned_amount_str = amount_str.replace('+', '').replace(',', '.')
             amount = float(cleaned_amount_str)
+            if amount <= 0:
+                return None
         except (ValueError, TypeError):
             return None
 
