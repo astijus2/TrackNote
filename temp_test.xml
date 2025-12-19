@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Document xmlns="urn:iso:std:iso:20022:tech:xsd:camt.053.001.02">
+    <BkToCstmrStmt>
+        <Stmt>
+            <Ntry>
+                <BookgDt><Dt>2025-11-06</Dt></BookgDt>
+                <Amt Ccy="EUR">40.00</Amt>
+                <CdtDbtInd>CRDT</CdtDbtInd>
+                <NtryDtls>
+                    <TxDtls>
+                        <RltdPties>
+                            <Dbtr><Nm>DAIVA ŠALTINIENĖ</Nm></Dbtr>
+                            <DbtrAcct><Id><IBAN>LT057300010009757487</IBAN></Id></DbtrAcct>
+                        </RltdPties>
+                        <RmtInf>
+                            <Strd>
+                                <CdtrRefInf>
+                                    <Tp><CdOrPrtry><Cd>SCOR</Cd></CdOrPrtry></Tp>
+                                    <Ref>304615435</Ref>
+                                </CdtrRefInf>
+                            </Strd>
+                        </RmtInf>
+                    </TxDtls>
+                </NtryDtls>
+            </Ntry>
+        </Stmt>
+    </BkToCstmrStmt>
+</Document>

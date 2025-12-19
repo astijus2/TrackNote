@@ -322,18 +322,24 @@ def main():
     
     user_config = config_dir / "user_config.json"
     
-    # First time setup
+    # First time setup - create config if missing
     if not user_config.exists():
         print("First time setup...")
+        config_dir.mkdir(parents=True, exist_ok=True)
+        # Create minimal config - workspace_id will be prompted in app
+        default_config = {
+            "first_run_date": __import__('datetime').datetime.now().isoformat()
+        }
         try:
-            from setup_wizard import show_setup_wizard
-            if not show_setup_wizard():
-                print("Setup wizard cancelled")
-                sys.exit(1)
-        except ImportError as e:
-            print(f"ERROR: Could not import setup wizard: {e}")
-            print("Please ensure setup_wizard.py is in the same directory")
-            sys.exit(1)
+            user_config.write_text(
+                __import__('json').dumps(default_config, indent=2),
+                encoding='utf-8'
+            )
+            print("Configuration initialized")
+        except Exception as e:
+            print(f"Warning: Could not create config: {e}")
+            # Continue anyway - app will handle missing config
+
     
     # Launch the app
     try:

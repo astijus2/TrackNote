@@ -103,7 +103,6 @@ a = Analysis(
         'firebase_sync',
         'firebase_gui_dialog',
         'data_source',
-        'setup_wizard',
         'loading_screen',
         'ui',
         'user_data',

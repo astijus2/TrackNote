@@ -8,9 +8,10 @@ import tkinter.font as tkfont
 from user_data import load_notes, save_notes, user_data_dir
 import subprocess, platform
 import time
-
 # Platform detection for Windows-specific fixes
 IS_WINDOWS = platform.system() == "Windows"
+
+from color_config import ColorConfig
 
 # Show "Open Data/Logs" only in dev or when explicitly enabled
 def _support_tools_enabled() -> bool:
@@ -44,6 +45,11 @@ def _wheel_steps(event) -> int:
     return int(d / unit) if abs(d) >= unit else (1 if d > 0 else -1)
 
 def attach_mousewheel(widget):
+    # macOS manages scrolling natively and smoothly. 
+    # Manual binding interferes and causes "jumping".
+    if platform.system() == "Darwin":
+        return
+
     def _on_wheel(e):
         steps = _wheel_steps(e)
         if steps:
@@ -60,7 +66,7 @@ def attach_mousewheel(widget):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title('Order Lookup')
+        self.title('Užsakymų paieška')
         
         # ---- Help menu: Open Data/Logs ----
         def _open_path(path: str):
@@ -78,16 +84,16 @@ class App(tk.Tk):
         self.config(menu=menubar)
 
         help_menu = tk.Menu(menubar, tearoff=0)
-        menubar.add_cascade(label="Help", menu=help_menu)
+        menubar.add_cascade(label="Pagalba", menu=help_menu)
         self.help_menu = help_menu  # expose to app.py
 
         if _support_tools_enabled():
             help_menu.add_command(
-                label="Open Data Folder",
+                label="Atidaryti duomenų aplanką",
                 command=lambda: _open_path(str(user_data_dir()))
             )
             help_menu.add_command(
-                label="Open Logs Folder",
+                label="Atidaryti žurnalų aplanką",
                 command=lambda: _open_path(str((user_data_dir() / "logs")))
             )
         # ---- end Help menu ----
@@ -123,9 +129,9 @@ class App(tk.Tk):
         except Exception: pass
         self.style.configure("Treeview", background="white", fieldbackground="white", foreground="black", rowheight=26)
         self.style.configure("Treeview.Heading", background="#f0f0f0", foreground="black")
-        self._sel_default_bg = "#79B8FF"
-        self._sel_default_fg = '#111111'
-        self.style.map("Treeview", background=[('selected', '#808080')], foreground=[('selected', 'white')])
+        self._sel_default_bg = ColorConfig.SEL_DEFAULT
+        self._sel_default_fg = ColorConfig.SEL_FG_DEFAULT
+        self.style.map("Treeview", background=[('selected', ColorConfig.SEL_DEFAULT)], foreground=[('selected', ColorConfig.SEL_FG_DEFAULT)])
         
         # --- NEW: Border for selection (using focus ring) ---
         # self.style.configure("Treeview.Item", borderwidth=2, relief="solid") # Doesn't work well on Mac
@@ -164,31 +170,31 @@ class App(tk.Tk):
         # ===== Top bar =====
         top = tk.Frame(self, bg='white'); top.pack(fill='x', padx=10, pady=10)
 
-        tk.Label(top, text='Name filter:', bg='white', fg='black').pack(side='left', padx=(0,6))
+        tk.Label(top, text='Vardo filtras:', bg='white', fg='black').pack(side='left', padx=(0,6))
         self.var_q = tk.StringVar()
         self.ent_name = tk.Entry(top, textvariable=self.var_q, width=28, bg='white', fg='black', insertbackground='black')
         self.ent_name.pack(side='left')
-        add_placeholder(self.ent_name, "Type name & surname…")
+        add_placeholder(self.ent_name, "Įveskite vardą ir pavardę…")
 
-        tk.Label(top, text='From:', bg='white', fg='black').pack(side='left', padx=(16,6))
+        tk.Label(top, text='Nuo:', bg='white', fg='black').pack(side='left', padx=(16,6))
         self.var_from = tk.StringVar()
         self.ent_from = tk.Entry(top, textvariable=self.var_from, width=12, bg='white', fg='black', insertbackground='black')
         self.ent_from.pack(side='left')
         add_placeholder(self.ent_from, "YYYY-MM-DD")
 
-        tk.Label(top, text='To:', bg='white', fg='black').pack(side='left', padx=(12,6))
+        tk.Label(top, text='Iki:', bg='white', fg='black').pack(side='left', padx=(12,6))
         self.var_to = tk.StringVar()
         self.ent_to = tk.Entry(top, textvariable=self.var_to, width=12, bg='white', fg='black', insertbackground='black')
         self.ent_to.pack(side='left')
         add_placeholder(self.ent_to, "YYYY-MM-DD")
 
-        self.btn_refresh = tk.Button(top, text='Refresh', bg='#e6e6e6', fg='black', relief='raised')
+        self.btn_refresh = tk.Button(top, text='Atnaujinti', bg='#e6e6e6', fg='black', relief='raised')
         self.btn_refresh.pack(side='left', padx=12)
 
-        self.btn_import = tk.Button(top, text='Import Statement', bg='#d0e0f0', relief='raised')
+        self.btn_import = tk.Button(top, text='Importuoti išrašą', bg='#d0e0f0', relief='raised')
         self.btn_import.pack(side='left', padx=(0, 12))
 
-        self.btn_clear_filters = tk.Button(top, text='Clear filters', bg='#f3f3f3', relief='raised')
+        self.btn_clear_filters = tk.Button(top, text='Išvalyti filtrus', bg='#f3f3f3', relief='raised')
         self.btn_clear_filters.pack(side='left', padx=8)
 
         # --- MODIFIED: View toggle button on the right ---
@@ -201,7 +207,7 @@ class App(tk.Tk):
         # self.btn_toggle_view = tk.Button(right_top, text='Show Completed History', bg='#6c757d', fg='white', relief='raised', font=('Segoe UI', 9, 'bold'))
         # self.btn_toggle_view.pack(side='left', padx=8)
         
-        self.btn_help = tk.Button(right_top, text='Help', bg='#f3f3f3', relief='raised', bd=1, highlightthickness=0)
+        self.btn_help = tk.Button(right_top, text='Pagalba', bg='#f3f3f3', relief='raised', bd=1, highlightthickness=0)
         self.btn_help.pack(side='left', padx=(8,0))
         self._help_dropdown = tk.Menu(self, tearoff=0)
         self.btn_help.configure(command=lambda: self._show_help_dropdown_at(self.btn_help))
@@ -211,27 +217,20 @@ class App(tk.Tk):
         actions = tk.Frame(self, bg='white'); actions.pack(fill='x', padx=10, pady=(0,8))
 
         left = tk.Frame(actions, bg='white'); left.pack(side='left')
-        self.btn_select_all = tk.Button(left, text='Select all (visible)', bg='#f3f3f3', relief='raised')
+        self.btn_select_all = tk.Button(left, text='Pažymėti viską (matomus)', bg='#f3f3f3', relief='raised')
         self.btn_select_all.pack(side='left', padx=(0,8))
-        self.btn_clear_sel = tk.Button(left, text='Clear selection', bg='#f3f3f3', relief='raised')
+        self.btn_clear_sel = tk.Button(left, text='Išvalyti pažymėjimą', bg='#f3f3f3', relief='raised')
         self.btn_clear_sel.pack(side='left', padx=(0,16))
-        self.btn_toggle_pkg = tk.Button(left, text='Mark Yellow (Packaged)', bg='#fff4b8', relief='raised')
+        self.btn_toggle_pkg = tk.Button(left, text='Žymėti geltona (Supakuota)', bg=ColorConfig.PKG_BG, relief='raised')
         self.btn_toggle_pkg.pack(side='left')
-        self.btn_toggle_stk = tk.Button(left, text='Mark Blue (Sticker)', bg='#dcecff', relief='raised')
+        self.btn_toggle_stk = tk.Button(left, text='Žymėti mėlyna (Lipdukas)', bg=ColorConfig.STK_BG, relief='raised')
         self.btn_toggle_stk.pack(side='left', padx=8)
-        self.btn_clear_status = tk.Button(left, text='Clear status (selected)', bg='#f3f3f3', relief='raised')
+        self.btn_clear_status = tk.Button(left, text='Išvalyti statusą (pažymėtus)', bg='#f3f3f3', relief='raised')
         self.btn_clear_status.pack(side='left', padx=8)
 
-        legend = tk.Frame(actions, bg='white'); legend.pack(side='right')
-        tk.Label(legend, text='Legend:', bg='white', fg='black').pack(side='left', padx=(8,6))
-        def legend_item(color, text):
-            box = tk.Label(legend, width=2, height=1, bg=color, bd=1, relief='solid')
-            box.pack(side='left', padx=(0,2))
-            tk.Label(legend, text=text, bg='white', fg='black').pack(side='left', padx=(6,10))
-        legend_item('#ffffff', 'None')
-        legend_item('#fff4b8', 'Packaged')
-        legend_item('#dcecff', 'Sticker')
-        legend_item('#d6f5d6', 'Both')
+        # Removed static legend from here to move to bottom
+        self.lbl_counts = tk.Label(actions, text='', bg='white', fg='black', font=('Segoe UI', 10, 'bold'))
+        self.lbl_counts.pack(side='right', padx=(0, 10))
 
         # ===== Table (Treeview) =====
         mid = tk.Frame(self, bg='white'); mid.pack(fill='both', expand=True, padx=10, pady=(0,6))
@@ -242,7 +241,7 @@ class App(tk.Tk):
         self.tbl = ttk.Treeview(mid, columns=cols, show='headings')
 
         attach_mousewheel(self.tbl)
-        headers = {'sel':'', 'date':'Date', 'price':'Price', 'iban':'IBAN', 'comment':'Comment', 'name':'Name', 'note':'Note'}
+        headers = {'sel':'', 'date':'Data', 'price':'Kaina', 'iban':'IBAN', 'comment':'Komentaras', 'name':'Vardas', 'note':'Pastaba'}
         for c in cols:
             self.tbl.heading(c, text=headers[c])
         self.tbl.column('sel', width=34, anchor='center')
@@ -301,20 +300,47 @@ class App(tk.Tk):
         self.lbl_status = tk.Label(self, text='', bg='white', fg='#007ACC', font=('Segoe UI', 11, 'bold'))
         self.lbl_status.pack(side='bottom', pady=(0, 5))
 
-        BOTTOM_HEIGHT = 110
+        BOTTOM_HEIGHT = 100
         bottom.configure(height= BOTTOM_HEIGHT)
         bottom.pack_propagate(False)
 
-        left = tk.Frame(bottom, bg='white');  left.pack(side='left',  fill='both', expand=True, padx=(0,6))
-        right = tk.Frame(bottom, bg='white'); right.pack(side='left', fill='both', expand=True, padx=(6,0))
+        # Main container for bottom content
+        bottom_content = tk.Frame(bottom, bg='white')
+        bottom_content.pack(fill='both', expand=True)
 
-        tk.Label(left,  text='Statement comment:', bg='white', fg='black').pack(anchor='w')
-        tk.Label(right, text='Custom note:',       bg='white', fg='black').pack(anchor='w')
+        # Right: Legend (Pack FIRST to allow it to reserve space)
+        right_legend = tk.Frame(bottom_content, bg='white', width=150)
+        right_legend.pack(side='right', fill='y', padx=(6,0))
 
-        self._bottom_font = tkfont.Font(family='Segoe UI', size=16)
-        self.txt_stmt = tk.Text(left,  height=6, wrap='word', bg='white', fg='black', font=self._bottom_font)
+        # Left side: Comment box
+        left = tk.Frame(bottom_content, bg='white')
+        left.pack(side='left', fill='both', expand=True, padx=(0,6))
+        
+        # Middle: Note box
+        middle = tk.Frame(bottom_content, bg='white')
+        middle.pack(side='left', fill='both', expand=True, padx=(6,6))
+
+        tk.Label(left,  text='Išrašo komentaras:', bg='white', fg='black').pack(anchor='w')
+        tk.Label(middle, text='Asmeninė pastaba:',       bg='white', fg='black').pack(anchor='w')
+
+        # Legend items
+        tk.Label(right_legend, text='Legenda:', bg='white', fg='black', font=('Segoe UI', 9, 'bold')).pack(anchor='nw', pady=(0, 4))
+        
+        def legend_item(parent, color, text):
+            row = tk.Frame(parent, bg='white')
+            row.pack(fill='x', pady=1)
+            tk.Label(row, width=2, height=1, bg=color, bd=1, relief='solid', font=('Segoe UI', 6)).pack(side='left', padx=(0,4))
+            tk.Label(row, text=text, bg='white', fg='black', font=('Segoe UI', 9)).pack(side='left')
+
+        legend_item(right_legend, ColorConfig.NONE_BG, 'Nieko')
+        legend_item(right_legend, ColorConfig.PKG_BG, 'Supakuota')
+        legend_item(right_legend, ColorConfig.STK_BG, 'Lipdukas')
+        legend_item(right_legend, ColorConfig.BOTH_BG, 'Abu')
+
+        self._bottom_font = tkfont.Font(family='Segoe UI', size=14)
+        self.txt_stmt = tk.Text(left,  height=3, wrap='word', bg='white', fg='black', font=self._bottom_font)
         attach_mousewheel(self.txt_stmt)
-        self.txt_note = tk.Text(right, height=6, wrap='word', bg='white', fg='black', font=self._bottom_font)
+        self.txt_note = tk.Text(middle, height=3, wrap='word', bg='white', fg='black', font=self._bottom_font)
         attach_mousewheel(self.txt_note)
 
         self.txt_stmt.pack(fill='both', expand=True)
@@ -331,10 +357,10 @@ class App(tk.Tk):
 
         # --- Context Menu for Right-Click ---
         self.context_menu = tk.Menu(self, tearoff=0)
-        self.context_menu.add_command(label="Mark Yellow (Packaged)", command=lambda: self.event_generate("<<CtxTogglePkg>>"))
-        self.context_menu.add_command(label="Mark Blue (Sticker)", command=lambda: self.event_generate("<<CtxToggleStk>>"))
+        self.context_menu.add_command(label="Žymėti geltona (Supakuota)", command=lambda: self.event_generate("<<CtxTogglePkg>>"))
+        self.context_menu.add_command(label="Žymėti mėlyna (Lipdukas)", command=lambda: self.event_generate("<<CtxToggleStk>>"))
         self.context_menu.add_separator()
-        self.context_menu.add_command(label="Clear Colors", command=lambda: self.event_generate("<<CtxClearStatus>>"))
+        self.context_menu.add_command(label="Išvalyti spalvas", command=lambda: self.event_generate("<<CtxClearStatus>>"))
 
     def _on_row_interact(self):
         if hasattr(self, '_interact_after_id') and self._interact_after_id:
@@ -481,6 +507,7 @@ class App(tk.Tk):
             tree = self.tbl
             if not tree.winfo_ismapped(): return
             
+            # --- 1. Identify Note Column X/width ---
             if not self._note_col_id:
                 try:
                     note_idx = list(tree['columns']).index('note')
@@ -490,22 +517,51 @@ class App(tk.Tk):
             if not hasattr(self, "_note_widgets"): self._note_widgets = {}
             parent = self._overlay_parent
             
+            # --- 2. ROBUST VISIBILITY DETECTION (Contiguous Iterator) ---
+            # Instead of probing pixels (which can miss rows), we find the top item
+            # and walk down the tree using tree.next() until we go off-screen.
             visible_iids = set()
-            children = tree.get_children("")
-            if not children: return
             
-            for iid in children:
-                try:
-                    bbox = tree.bbox(iid, self._note_col_id)
-                    if bbox: visible_iids.add(iid)
-                    if bbox and bbox[1] > tree.winfo_height(): break
-                except: pass
+            # Find the first visible item at the top
+            # Check a range of points at the top to be robust against headers/partial scroll
+            start_iid = None
+            for y_probe in range(1, 100, 5):
+                start_iid = tree.identify_row(y_probe)
+                if start_iid: break
             
+            if start_iid:
+                curr = start_iid
+                tree_height = tree.winfo_height()
+                
+                # Safety break to prevent infinite loops if tree state is corrupted
+                max_loops = 200 
+                loop_count = 0
+                
+                while curr and loop_count < max_loops:
+                    # Check if this item is actually visible
+                    bbox = tree.bbox(curr, self._note_col_id)
+                    if not bbox:
+                        pass
+                    else:
+                        _x, y, _w, h = bbox
+                        if y > tree_height: break # maximizing efficiency: stop once we leave screen
+                        visible_iids.add(curr)
+                    
+                    curr = tree.next(curr)
+                    loop_count += 1
+            
+            # --- SAFETY CHECK: If we found NO visible rows, something went wrong with detection.
+            # DO NOT clear widgets, just abort this update to prevent "flashing" empty.
+            if not visible_iids:
+                return
+
+            # --- 3. Hide non-visible widgets (Cleanup) ---
             for iid in list(self._note_widgets.keys()):
                 if iid not in visible_iids:
                     try: self._note_widgets[iid].place_forget()
                     except: pass
             
+            # --- 4. Place visible widgets ---
             try:
                 rx = tree.winfo_rootx() - parent.winfo_rootx()
                 ry = tree.winfo_rooty() - parent.winfo_rooty()
@@ -517,6 +573,16 @@ class App(tk.Tk):
                     if not bbox: continue
                     
                     x, y, w, h = bbox
+                    
+                    # Vertical Clipping: Ensure widget doesn't extend past the bottom
+                    tree_height = tree.winfo_height()
+                    if y + h > tree_height:
+                        h = tree_height - y
+                    
+                    if h < 10: 
+                        if iid in self._note_widgets: self._note_widgets[iid].place_forget()
+                        continue 
+                    
                     editor = self._note_widgets.get(iid)
                     if editor is None:
                         editor = self._make_note_entry(iid)
@@ -524,7 +590,12 @@ class App(tk.Tk):
                     
                     pad_x, pad_y, y_offset = (4, 1, 1) if IS_WINDOWS else (4, 3, 0)
                     
-                    editor.place_configure(x=rx + x + pad_x, y=ry + y + pad_y - y_offset, width=w - 2*pad_x - 2, height=h - 2*pad_y + 2)
+                    final_h = h - 2*pad_y
+                    if final_h < 5:
+                        editor.place_forget()
+                        continue
+
+                    editor.place_configure(x=rx + x + pad_x, y=ry + y + pad_y - y_offset, width=w - 2*pad_x - 2, height=final_h)
                     editor.lift()
                 except: pass
         except: pass

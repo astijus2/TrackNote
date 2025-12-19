@@ -18,9 +18,14 @@ from parsing import split_details, normalize, BankStatementParser, StatementPars
 from data_source import fetch_rows
 from sheets_cache import clear_cache
 from ui import App
+from color_config import ColorConfig
 from firebase_sync import FirebaseSync, load_firebase_config
+from db_manager import DatabaseManager
 
-from typing import Optional, Tuple, Dict
+
+
+from typing import Optional, Tuple, Dict, List
+
 import base64, subprocess, uuid, datetime as _dt
 # --- Licensing: fingerprint, Ed25519 verify, trial ---
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -143,15 +148,15 @@ def verify_license_key(license_key: str) -> Tuple[bool, str, Optional[Dict]]:
 
 def show_license_dialog(app) -> bool:
     while True:
-        key = _sd.askstring("Enter License Key", "Paste your TrackNote license key:", parent=app)
+        key = _sd.askstring("Įveskite licencijos raktą", "Įklijuokite savo TrackNote licencijos raktą:", parent=app)
         if key is None: return False
         ok, msg, _pl = verify_license_key(key)
         if ok:
             store_license_key(key)
-            _mb.showinfo("TrackNote", "License activated. Thank you!")
+            _mb.showinfo("TrackNote", "Licencija aktyvuota. Ačiū!")
             return True
         else:
-            _mb.showerror("TrackNote", f"{msg}\n\nPlease check and try again.")
+            _mb.showerror("TrackNote", f"{msg}\n\nPatikrinkite ir bandykite dar kartą.")
 
 def license_status_string() -> str:
     key = read_license_key()
@@ -164,9 +169,9 @@ def license_status_string() -> str:
             exp_date = _dt.date.fromisoformat(exp_str)
             days_left = (exp_date - _dt.date.today()).days
             if days_left <= 0: return ""
-            return f"Licensed (expires {exp_str})"
-        except: return "Licensed"
-    return "Licensed"
+            return f"Licencijuota (galioja iki {exp_str})"
+        except: return "Licencijuota"
+    return "Licencijuota"
 
 def check_trial():
     cfg = read_user_config()
@@ -174,36 +179,32 @@ def check_trial():
     if not first_run:
         cfg["first_run_date"] = _dt.datetime.now().isoformat()
         write_user_config(cfg)
-        return (True, "Trial started")
+        return (True, "Bandomoji versija pradėta")
     key = read_license_key()
     if key:
         ok, msg, _pl = verify_license_key(key)
-        if ok: return (True, "Licensed")
+        if ok: return (True, "Licencijuota")
     try:
         first = _dt.datetime.fromisoformat(first_run)
         elapsed = (_dt.datetime.now() - first).days
         if elapsed < TRIAL_DAYS:
             remaining = TRIAL_DAYS - elapsed
-            return (True, f"Trial: {remaining} days left")
-        else: return (False, "Trial expired")
-    except Exception: return (True, "Trial active")
+            return (True, f"Bandomoji versija: liko {remaining} d.")
+        else: return (False, "Bandomoji versija baigėsi")
+    except Exception: return (True, "Bandomoji versija aktyvi")
 
 # ===== GLOBALS & APP STATE =====
 FIREBASE_SYNC: Optional[FirebaseSync] = None
-STATUS = {}
-_df = pd.DataFrame()
+DB_MANAGER: Optional[DatabaseManager] = None
 # VIEW_MODE removed
 
 # ---------- Tag colors & Configuration ----------
-TAGS = {'none':{'bg':'#ffffff'},'packaged':{'bg':'#fff4b8'},'sticker':{'bg':'#dcecff'},'both':{'bg':'#d6f5d6'}}
-def status_to_tag(st: dict) -> str:
-    p, s = st.get('pkg', 0), st.get('stk', 0)
-    if p and s: return 'both'
-    if p: return 'packaged'
-    if s: return 'sticker'
-    return 'none'
+def status_to_tag(st: Optional[dict]) -> str:
+    if not isinstance(st, dict): st = {}
+    return ColorConfig.get_status_tag(st.get('pkg', 0), st.get('stk', 0))
+
 def configure_tags(app: App):
-    for name, spec in TAGS.items():
+    for name, spec in ColorConfig.get_tag_config().items():
         try: app.tbl.tag_configure(name, background=spec['bg'])
         except Exception: pass
 
@@ -231,13 +232,14 @@ def undo_last_action(app: App):
             if app.tbl.exists(key):
                 new_tag = status_to_tag(old_status)
                 current_tags = list(app.tbl.item(key, "tags"))
-                for t in TAGS.keys():
+                for t in ColorConfig.get_tag_config().keys():
                     if t in current_tags: current_tags.remove(t)
                 current_tags.append(new_tag)
                 app.tbl.item(key, tags=tuple(current_tags))
         
         # Update selection style to match restored status
         update_selection_style(app)
+        update_counts(app)
         # app.lbl_status.config(text="↺ Undid last action")
         # app.after(2000, lambda: app.lbl_status.config(text=""))
 
@@ -271,206 +273,321 @@ def _create_transaction_fingerprint(tx: dict) -> str:
     raw_string = "|".join([str(tx.get('date', '')).strip(), str(tx.get('payer', '')).strip(), str(tx.get('details', '')).strip(), standard_amount])
     return hashlib.sha1(raw_string.encode("utf-8")).hexdigest()
 
-# ---------- Core Rendering Logic ----------
-def render(app: App):
-    """Renders ALL data sorted by name."""
-    global _df, STATUS
+# ---------- Status Counting ----------
+def update_counts(app: App):
+    """Updates the count label in the top bar with current status statistics."""
+    global DB_MANAGER
     
-    app.tbl.delete(*app.tbl.get_children())
-    
-    if _df.empty:
-        app.lbl_view_info.config(text="No transactions found.")
+    if not DB_MANAGER:
+        app.lbl_counts.config(text="")
         return
 
-    # Update status tags
-    display_df = _df.copy()
-    display_df['status_tag'] = [status_to_tag(STATUS.get(idx, {})) for idx in display_df.index]
+    # Get stats from SQLite (instant, optimized query)
+    stats = DB_MANAGER.get_stats()
     
-    # SIMPLIFIED LOGIC: Show ALL rows, sorted by Name then Date
+    total = stats['active']  # Show only active (non-archived) count
+    c_none = stats['none']
+    c_pkg = stats['packaged']
+    c_stk = stats['sticker']
+    c_both = stats['done']
     
-    # --- FILTERING ---
-    # Use _val to ignore placeholder text (e.g. "Type name...")
-    q = (_val(app.ent_name, app.var_q) or "").lower().strip()
-    d_from = _parse_date_input(_val(app.ent_from, app.var_from))
-    d_to = _parse_date_input(_val(app.ent_to, app.var_to))
+    # Format: Iš viso: 50 | Nieko: 10 | Supakuota: 5 | Lipdukas: 5 | Atlikta: 30
+    text = f"Iš viso: {total}   |   Nieko: {c_none}   |   Supakuota: {c_pkg}   |   Lipdukas: {c_stk}   |   Atlikta: {c_both}"
+    app.lbl_counts.config(text=text)
+
+# ---------- Core Rendering Logic ----------
+def render(app: App, max_visible_rows: int = 1000, append_mode: bool = False):
+    """Renders transactions from SQLite with filtering and virtual scrolling."""
+    global DB_MANAGER
     
-    mask = pd.Series([True] * len(display_df), index=display_df.index)
-    
-    if q:
-        # Filter by name (normalized)
-        mask &= display_df['name_norm'].str.contains(q, na=False)
-    
-    if d_from:
-        mask &= (display_df['date'] >= str(d_from))
-    
-    if d_to:
-        mask &= (display_df['date'] <= str(d_to))
-        
-    view = display_df[mask]
-    
-    count = len(view)
-    if count == 0:
-        app.lbl_view_info.config(text="No matching transactions.")
+    if not append_mode:
+        # Clear on fresh render
+        app.tbl.delete(*app.tbl.get_children())
     else:
-        app.lbl_view_info.config(text=f"Showing {count} transaction{'s' if count!=1 else ''}")
+        # Remove existing "Load More" button if present
+        if app.tbl.exists('load_more_btn'):
+            app.tbl.delete('load_more_btn')
     
-    # Sort by Name (normalized) then Date (descending)
-    view = view.sort_values(by=['name_norm', 'date'], ascending=[True, False])
+    if not DB_MANAGER:
+        app.lbl_view_info.config(text="Nėra duomenų bazės ryšio.")
+        return
+
+    # Get filter values (ignore placeholder text)
+    q = (_val(app.ent_name, app.var_q) or "").lower().strip()
+    d_from_date = _parse_date_input(_val(app.ent_from, app.var_from))
+    d_to_date = _parse_date_input(_val(app.ent_to, app.var_to))
     
-    if not view.empty:
-        # FLAT LIST: No grouping, just list everyone sorted by name
-        # OPTIMIZATION: Batch insertion to prevent UI freeze
+    # Convert dates to strings for SQL query
+    d_from = str(d_from_date) if d_from_date else None
+    d_to = str(d_to_date) if d_to_date else None
+    
+    # Check if archive view is active
+    include_archived = getattr(app, '_archive_visible', False)
+    
+    # Determine offset for pagination
+    if append_mode:
+        # Load next batch starting from currently loaded count
+        offset = getattr(app, '_loaded_count', 0)
+    else:
+        # Fresh render, start from 0
+        offset = 0
+        app._loaded_count = 0
+    
+    # Store current filters for Load More button
+    app._current_filters = {
+        'name_query': q if q else None,
+        'date_from': d_from,
+        'date_to': d_to,
+        'include_archived': include_archived
+    }
+    
+    # Query SQLite with filters and VIRTUAL SCROLLING limit
+    transactions, total_count = DB_MANAGER.search_transactions(
+        name_query=app._current_filters['name_query'],
+        date_from=app._current_filters['date_from'],
+        date_to=app._current_filters['date_to'],
+        include_archived=app._current_filters['include_archived'],
+        limit=max_visible_rows,
+        offset=offset
+    )
+    
+    # Store total count
+    app._total_count = total_count
+    
+    count = len(transactions)
+    if count == 0 and not append_mode:
+        app.lbl_view_info.config(text="Nerasta atitinkančių transakcijų.")
+        update_counts(app)
+        return
+    
+    # Update loaded count
+    if append_mode:
+        app._loaded_count += count
+    else:
+        app._loaded_count = count
+    
+    # Show viewport info with helpful message
+    archive_suffix = " (įskaitant archyvą)" if include_archived else ""
+    if app._total_count > app._loaded_count:
+        # More results available
+        app.lbl_view_info.config(
+            text=f"Rodoma {app._loaded_count:,} iš {app._total_count:,} iš viso{archive_suffix} (paspauskite 'Įkelti daugiau' kitai daliai)"
+        )
+    else:
+        # Showing all results
+        app.lbl_view_info.config(
+            text=f"Rodomos visos {app._loaded_count:,} transakcij{'os' if app._loaded_count!=1 else 'a'}{archive_suffix}"
+        )
+    
+    # Optimized batch rendering
+    batch_size = 300 if IS_WINDOWS else 200
+    delay = 10 if IS_WINDOWS else 5
+    
+    # Cancel any previous batch job
+    if hasattr(app, 'current_batch_job') and app.current_batch_job:
+        try: app.after_cancel(app.current_batch_job)
+        except: pass
+    app.current_batch_job = None
+    
+    def _insert_batch(start_idx):
+        if getattr(app, '_is_closing', False): 
+            return
         
-        # Cancel any previous batch job
-        if hasattr(app, 'current_batch_job') and app.current_batch_job:
-            try: app.after_cancel(app.current_batch_job)
-            except: pass
-        app.current_batch_job = None
+        end_idx = min(start_idx + batch_size, count)
         
-        # Convert to list of tuples for faster iteration
-        rows_to_insert = []
-        for key, r in view.iterrows():
-            values = (_checkbox_cell_for(key), r['date'], r['price'], r['iban'], r['comment'], r['name'], '')
-            tags = (r['status_tag'],)
-            rows_to_insert.append((key, values, tags))
+        for i in range(start_idx, end_idx):
+            tx = transactions[i]
+            key = tx['key']
             
-        total_rows = len(rows_to_insert)
-        # Windows Optimization: Larger batches, less frequent updates
-        batch_size = 200 if IS_WINDOWS else 50
-        delay = 10 if IS_WINDOWS else 5
+            # Determine status tag
+            pkg = tx.get('pkg', 0) or 0
+            stk = tx.get('stk', 0) or 0
+            tag = ColorConfig.get_status_tag(pkg, stk)
+            
+            values = (
+                _checkbox_cell_for(key),
+                tx['date'],
+                tx.get('price', 0),
+                tx.get('iban', ''),
+                tx.get('comment', ''),
+                tx['name'],
+                ''
+            )
+            
+            app.tbl.insert('', 'end', iid=key, values=values, tags=(tag,))
         
-        def _insert_batch(start_idx):
-            if getattr(app, '_is_closing', False): return
+        if end_idx < count:
+            # Schedule next batch
+            app.current_batch_job = app.after(delay, lambda: _insert_batch(end_idx))
+        else:
+            # Finished rendering all transactions in this batch
+            app.current_batch_job = None
             
-            end_idx = min(start_idx + batch_size, total_rows)
-            for i in range(start_idx, end_idx):
-                key, values, tags = rows_to_insert[i]
-                app.tbl.insert('', 'end', iid=key, values=values, tags=tags)
-            
-            if end_idx < total_rows:
-                # Schedule next batch
-                app.current_batch_job = app.after(delay, lambda: _insert_batch(end_idx))
-            else:
-                app.current_batch_job = None
+            # Add "Load More" button if more data available
+            if app._loaded_count < app._total_count:
+                _add_load_more_button(app)
 
-        # Start first batch immediately
-        _insert_batch(0)
+    # Start first batch immediately
+    _insert_batch(0)
 
-def load_and_render_async(app: App):
-    """Loads all data from Firebase, performing a first-time import if needed."""
-    app.lbl_status.config(text="☁️ Syncing data from cloud...")
+    # Update counts after render
+    update_counts(app)
+
+def _add_load_more_button(app: App):
+    """Adds a Load More button row at the bottom of the Treeview."""
+    remaining = app._total_count - app._loaded_count
+    button_text = f"▼ Įkelti dar {min(1000, remaining):,} (liko {remaining:,}) ▼"
+    
+    # Insert special row with button text
+    app.tbl.insert('', 'end', iid='load_more_btn', 
+                   values=('', '', '', button_text, '', '', ''),
+                   tags=('load_more',))
+    
+    # Style the load more row (blue background, centered text)
+    app.tbl.tag_configure('load_more', background='#E3F2FD', foreground='#1976D2', 
+                         font=('Segoe UI', 10, 'bold'))
+
+def load_more_transactions(app: App):
+    """Loads the next batch of transactions and appends to existing view."""
+    render(app, max_visible_rows=1000, append_mode=True)
+
+def load_and_render_async(app: App, include_archive=False):
+    """Loads data from local SQLite (instant) and syncs with Firebase in background."""
+    global DB_MANAGER
+    
+    app.lbl_status.config(text="📊 Įkeliami duomenys...")
     
     def _background_load():
-        global _df, STATUS
         try:
-            if not (FIREBASE_SYNC and FIREBASE_SYNC.is_connected()):
-                raise ConnectionError("Not connected to the sync service.")
+            # INSTANT: Load from local SQLite database
+            app.after(0, lambda: render(app))
+            app.after(0, lambda: app.lbl_status.config(text="✅ Įkelta"))
+            app.after(2000, lambda: app.lbl_status.config(text=""))
             
-            STATUS = FIREBASE_SYNC.get_all_status()
-            transactions_dict = FIREBASE_SYNC.get_all_transactions()
-            
-            if not transactions_dict:
-                app.after(0, lambda: app.lbl_status.config(text="☁️ Performing first-time import from source..."))
-                cfg = read_user_config()
-                initial_rows = fetch_rows(cfg)
+            # BACKGROUND: Sync with Firebase (non-blocking)
+            if FIREBASE_SYNC and FIREBASE_SYNC.is_connected():
+                _sync_with_firebase()
                 
-                new_transactions_batch = {}
-                keys_in_this_import = set()
-                
-                for row_no, date, price, details in initial_rows:
-                    name, iban, comment = split_details(details)
-                    tx_like = {'date': str(date or ''), 'payer': name, 'details': comment, 'amount': price}
-                    fingerprint = _create_transaction_fingerprint(tx_like)
-                    
-                    if fingerprint in keys_in_this_import: continue
-                    keys_in_this_import.add(fingerprint)
-                    
-                    new_transactions_batch[fingerprint] = {
-                        'key': fingerprint, 'date': str(date or ''), 'price': _parse_price(price),
-                        'name': name, 'iban': iban, 'comment': comment,
-                        'row_no': 0, 'name_norm': normalize(name),
-                        'date_obj': pd.to_datetime(str(date), errors='coerce').date().isoformat() if date else None
-                    }
-                
-                if new_transactions_batch:
-                    FIREBASE_SYNC.set_transactions_batch(new_transactions_batch)
-                    transactions_dict = new_transactions_batch
-            
-            if transactions_dict:
-                _df = pd.DataFrame.from_dict(transactions_dict, orient='index')
-                if 'key' not in _df.columns: _df['key'] = _df.index
-                _df.set_index('key', inplace=True, drop=False)
-            else:
-                _df = pd.DataFrame()
+        except Exception as e:
+            app.after(0, lambda: messagebox.showerror("Įkėlimo klaida", f"Nepavyko įkelti duomenų:\n{e}"))
+            app.after(0, lambda: app.lbl_status.config(text="Įkėlimas nepavyko"))
+    
+    def _sync_with_firebase():
 
-            app.after(0, lambda: _finish_load(app))
+        """Background sync with Firebase - updates SQLite if there are changes."""
+        try:
+            # Get Firebase data
+            firebase_transactions = FIREBASE_SYNC.get_all_transactions()
+            firebase_statuses = FIREBASE_SYNC.get_all_status()
+            firebase_notes = FIREBASE_SYNC.get_all_notes()
+            
+            # Check if we need to import from Firebase (first time or empty DB)
+            stats = DB_MANAGER.get_stats()
+            if stats['total'] == 0 and firebase_transactions:
+                # Import all from Firebase
+                print("📥 Importing from Firebase to SQLite...")
+                DB_MANAGER.bulk_insert_transactions(firebase_transactions)
+                
+                # Import statuses
+                status_updates = {k: (v.get('pkg', 0), v.get('stk', 0)) 
+                                for k, v in firebase_statuses.items()}
+                if status_updates:
+                    DB_MANAGER.bulk_update_status(status_updates)
+                
+                # Import notes
+                for key, note_text in firebase_notes.items():
+                    if note_text and note_text.strip():
+                        DB_MANAGER.update_note(key, note_text)
+                
+                # Refresh UI
+                app.after(0, lambda: render(app))
+                print("✅ Firebase sync complete")
             
         except Exception as e:
-            app.after(0, lambda: messagebox.showerror("Sync Error", f"Could not load data from the cloud:\n{e}"))
-            app.after(0, lambda: app.lbl_status.config(text="Sync failed"))
-    
-    def _finish_load(app):
-        render(app)
-        app.lbl_status.config(text="✅ Synced")
-        app.after(2000, lambda: app.lbl_status.config(text=""))
+            print(f"⚠️ Background Firebase sync failed: {e}")
     
     threading.Thread(target=_background_load, daemon=True).start()
 
 def import_statement(app: App):
     if not (FIREBASE_SYNC and FIREBASE_SYNC.is_connected()):
-        messagebox.showerror("Sync Error", "Cannot import: Not connected to the sync service.")
+        messagebox.showerror("Sinchronizavimo klaida", "Negalima importuoti: nėra ryšio su sinchronizavimo paslauga.")
         return
 
-    filepath = filedialog.askopenfilename(title="Select Bank Statement", filetypes=(("Excel Files", "*.xlsx"), ("All files", "*.*")))
-    if not filepath: return
+    def _select_and_import():
+        # Prevent crash on macOS by ensuring the dialog opens after the button click event is fully processed
+        filepath = filedialog.askopenfilename(
+            title="Pasirinkite banko išrašą",
+            parent=app,
+            filetypes=(
+                ("Visi palaikomi", "*.xlsx *.xls *.xml *.pdf"), 
+                ("Excel failai", "*.xlsx"), 
+                ("XML failai", "*.xml"), 
+                ("PDF failai", "*.pdf"), 
+                ("Visi failai", "*.*")
+            )
+        )
+        if not filepath: return
 
-    try:
-        parser = BankStatementParser()
-        parsed_transactions = parser.parse(filepath)
-        existing_keys = FIREBASE_SYNC.get_transaction_keys()
-        new_records_batch = {}
-        new_count, db_duplicate_count, file_duplicate_count = 0, 0, 0
-        keys_in_this_import = set()
+        try:
+            parser = BankStatementParser()
+            parsed_transactions = parser.parse(filepath)
+            existing_keys = FIREBASE_SYNC.get_transaction_keys()
+            new_records_batch = {}
+            new_count, db_duplicate_count, file_duplicate_count = 0, 0, 0
+            keys_in_this_import = set()
 
-        for tx in parsed_transactions:
-            tx_for_hash = {'date': tx['date'], 'payer': tx['payer'], 'details': tx['details'], 'amount': tx['amount']}
-            fingerprint = _create_transaction_fingerprint(tx_for_hash)
+            for tx in parsed_transactions:
+                tx_for_hash = {'date': tx['date'], 'payer': tx['payer'], 'details': tx['details'], 'amount': tx['amount']}
+                fingerprint = _create_transaction_fingerprint(tx_for_hash)
 
-            if fingerprint in existing_keys or fingerprint in keys_in_this_import:
-                if fingerprint in existing_keys: db_duplicate_count += 1
-                else: file_duplicate_count += 1
-                continue
+                if fingerprint in existing_keys or fingerprint in keys_in_this_import:
+                    if fingerprint in existing_keys: db_duplicate_count += 1
+                    else: file_duplicate_count += 1
+                    continue
 
-            keys_in_this_import.add(fingerprint)
-            name, iban, comment = split_details(tx['payer'])
-            full_comment = f"{comment} | {tx['details']}".strip(" |") if tx['details'] else comment
+                keys_in_this_import.add(fingerprint)
+                name, iban, comment = split_details(tx['payer'])
+                full_comment = f"{comment} | {tx['details']}".strip(" |") if tx['details'] else comment
+                
+                # Use parsed IBAN if available, otherwise stick to split_details result
+                parsed_iban = tx.get('iban', '')
+                final_iban = parsed_iban if parsed_iban else iban
+
+                new_records_batch[fingerprint] = {
+                    'key': fingerprint, 'date': tx['date'], 'price': _parse_price(tx['amount']),
+                    'name': name, 'iban': final_iban, 'comment': full_comment,
+                    'row_no': 0, 'name_norm': normalize(name),
+                    'date_obj': pd.to_datetime(tx['date'], errors='coerce').date().isoformat()
+                }
+                new_count += 1
+
+            if new_records_batch:
+                FIREBASE_SYNC.set_transactions_batch(new_records_batch)
+
+            summary = (f"Importavimas baigtas!\n\n✅ Naujų: {new_count}\n⏭️ Praleista (DB): {db_duplicate_count}\n⏭️ Praleista (faile): {file_duplicate_count}")
+            messagebox.showinfo("Importavimo santrauka", summary)
             
-            new_records_batch[fingerprint] = {
-                'key': fingerprint, 'date': tx['date'], 'price': _parse_price(tx['amount']),
-                'name': name, 'iban': iban, 'comment': full_comment,
-                'row_no': 0, 'name_norm': normalize(name),
-                'date_obj': pd.to_datetime(tx['date'], errors='coerce').date().isoformat()
-            }
-            new_count += 1
+            # Auto-refresh after import
+            load_and_render_async(app)
 
-        if new_records_batch:
-            FIREBASE_SYNC.set_transactions_batch(new_records_batch)
+        except StatementParsingError as e:
+            messagebox.showerror("Netinkamas išrašo failas", str(e))
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Importavimo klaida", f"Įvyko netikėta klaida: {e}")
 
-        summary = (f"Import Complete!\n\n✅ New: {new_count}\n⏭️ Skipped (in DB): {db_duplicate_count}\n⏭️ Skipped (in file): {file_duplicate_count}")
-        messagebox.showinfo("Import Summary", summary)
-        
-        # Auto-refresh after import
-        load_and_render_async(app)
-
-    except StatementParsingError as e: messagebox.showerror("Invalid Statement File", str(e))
-    except Exception as e: messagebox.showerror("Import Error", f"An unexpected error occurred: {e}")
+    # Initialize idle tasks to process any pending events (like cursor changes) before opening dialog
+    app.update_idletasks()
+    # Schedule the dialog to open with a slight delay to allow the button click to resolve
+    app.after(50, _select_and_import)
 
 def prompt_for_workspace_id(app) -> Optional[str]:
     while True:
-        ws_id = _sd.askstring("Cloud Sync Setup", "To sync data, create a unique Workspace ID.\n\nEnter the *exact same ID* on all your computers.\n\nWorkspace ID:", parent=app)
+        ws_id = _sd.askstring("Debesų sinchronizavimo nustatymas", "Norint sinchronizuoti duomenis, sukurkite unikalų darbo srities ID.\n\nĮveskite *tą patį ID* visuose savo kompiuteriuose.\n\nDarbo srities ID:", parent=app)
         if ws_id is None: return None
         if ws_id and not ws_id.isspace(): return ws_id.strip()
-        _mb.showwarning("Invalid ID", "Workspace ID cannot be empty. Please try again.", parent=app)
+        _mb.showwarning("Netinkamas ID", "Darbo srities ID negali būti tuščias. Bandykite dar kartą.", parent=app)
 
 
 
@@ -497,7 +614,7 @@ def _batch_update_tags(app: App, updates: list):
             if app.tbl.exists(key):
                 # Preserve existing tags (like 'sel') but replace status tag
                 current_tags = list(app.tbl.item(key, "tags"))
-                for t in TAGS.keys():
+                for t in ColorConfig.get_tag_config().keys():
                     if t in current_tags: current_tags.remove(t)
                 current_tags.append(new_tag)
                 app.tbl.item(key, tags=tuple(current_tags))
@@ -507,109 +624,130 @@ def _batch_update_tags(app: App, updates: list):
             
     _update_chunk(0)
 
+
 def toggle_status(field, app: App):
+    global DB_MANAGER
     keys = set(CHECKED)
     if not keys:
         sel = app.tbl.selection()
         if sel: keys = {s for s in sel if not s.startswith('group_')}
     if not keys: return
     
-    # Save history
-    history_data = {}
-    for key in keys:
-        history_data[key] = STATUS.get(key, {'pkg': 0, 'stk': 0}).copy()
-    HISTORY.append({'type': 'status', 'data': history_data})
+    # Save history (for undo feature - simplified for now)
+    # TODO: Implement proper undo with SQLite
     
     updates = []
     for key in keys:
-        st = STATUS.get(key, {'pkg': 0, 'stk': 0})
-        st[field] = 0 if st.get(field) else 1
-        FIREBASE_SYNC.set_status(key, st.get('pkg', 0), st.get('stk', 0))
+        # Get current status from SQLite
+        pkg, stk = DB_MANAGER.get_status(key)
         
-        # Prepare optimistic UI update
-        new_tag = status_to_tag(st)
+        # Toggle the field
+        if field == 'pkg':
+            pkg = 0 if pkg else 1
+        else:  # field == 'stk'
+            stk = 0 if stk else 1
+        
+        # Update SQLite immediately (instant)
+        DB_MANAGER.update_status(key, pkg, stk)
+        
+        # Update Firebase in background
+        if FIREBASE_SYNC:
+            FIREBASE_SYNC.set_status(key, pkg, stk)
+        
+        # Prepare UI update
+        new_tag = ColorConfig.get_status_tag(pkg, stk)
         updates.append((key, new_tag))
     
     # Execute batched UI update
     _batch_update_tags(app, updates)
+    
+    # Update selection style to match new status
+    update_selection_style(app)
+    update_counts(app)
 
 def context_toggle_status(field, app: App):
     """Context menu action: Targets SELECTION only, ignores checkboxes."""
+    global DB_MANAGER
     sel = app.tbl.selection()
     keys = {s for s in sel if not s.startswith('group_')}
     if not keys: return
 
-    # Save history
-    history_data = {}
     for key in keys:
-        history_data[key] = STATUS.get(key, {'pkg': 0, 'stk': 0}).copy()
-    HISTORY.append({'type': 'status', 'data': history_data})
-
-    for key in keys:
-        st = STATUS.get(key, {'pkg': 0, 'stk': 0})
-        st[field] = 0 if st.get(field) else 1
-        FIREBASE_SYNC.set_status(key, st.get('pkg', 0), st.get('stk', 0))
+        # Get current status from SQLite
+        pkg, stk = DB_MANAGER.get_status(key)
+        
+        # Toggle the field
+        if field == 'pkg':
+            pkg = 0 if pkg else 1
+        else:
+            stk = 0 if stk else 1
+        
+        # Update SQLite
+        DB_MANAGER.update_status(key, pkg, stk)
+        
+        # Update Firebase
+        if FIREBASE_SYNC:
+            FIREBASE_SYNC.set_status(key, pkg, stk)
         
         # Optimistic UI update
         if app.tbl.exists(key):
-            new_tag = status_to_tag(st)
+            new_tag = ColorConfig.get_status_tag(pkg, stk)
             current_tags = list(app.tbl.item(key, "tags"))
-            for t in TAGS.keys():
+            for t in ColorConfig.get_tag_config().keys():
                 if t in current_tags: current_tags.remove(t)
             current_tags.append(new_tag)
             app.tbl.item(key, tags=tuple(current_tags))
     
     # Update selection style to match new status
     update_selection_style(app)
+    update_counts(app)
 
 def context_clear_status(app: App):
     """Context menu action: Targets SELECTION only."""
+    global DB_MANAGER
     sel = app.tbl.selection()
     keys = {s for s in sel if not s.startswith('group_')}
     if not keys: return
     
-    # Save history
-    history_data = {}
     for key in keys:
-        history_data[key] = STATUS.get(key, {'pkg': 0, 'stk': 0}).copy()
-    HISTORY.append({'type': 'status', 'data': history_data})
-    
-    for key in keys:
-        # Update global STATUS immediately
-        STATUS[key] = {'pkg': 0, 'stk': 0}
-        FIREBASE_SYNC.set_status(key, 0, 0)
+        # Clear status in SQLite
+        DB_MANAGER.update_status(key, 0, 0)
+        
+        # Clear in Firebase
+        if FIREBASE_SYNC:
+            FIREBASE_SYNC.set_status(key, 0, 0)
+        
         # Optimistic UI update
         if app.tbl.exists(key):
             new_tag = 'none'
             current_tags = list(app.tbl.item(key, "tags"))
-            for t in TAGS.keys():
+            for t in ColorConfig.get_tag_config().keys():
                 if t in current_tags: current_tags.remove(t)
             current_tags.append(new_tag)
             app.tbl.item(key, tags=tuple(current_tags))
             
     # Update selection style to match new status
     update_selection_style(app)
+    update_counts(app)
 
 def clear_status_selected(app: App):
+    global DB_MANAGER
     keys = set(CHECKED)
     if not keys:
         sel = app.tbl.selection()
         if sel: keys = {s for s in sel if not s.startswith('group_')}
     if not keys: return
     
-    # Save history
-    history_data = {}
-    for key in keys:
-        history_data[key] = STATUS.get(key, {'pkg': 0, 'stk': 0}).copy()
-    HISTORY.append({'type': 'status', 'data': history_data})
-    
     updates = []
     for key in keys:
-        # Update global STATUS immediately so hidden rows are correct on re-render
-        STATUS[key] = {'pkg': 0, 'stk': 0}
-        FIREBASE_SYNC.set_status(key, 0, 0)
+        # Clear status in SQLite
+        DB_MANAGER.update_status(key, 0, 0)
         
-        # Prepare optimistic UI update
+        # Clear in Firebase
+        if FIREBASE_SYNC:
+            FIREBASE_SYNC.set_status(key, 0, 0)
+        
+        # Prepare UI update
         new_tag = 'none'
         updates.append((key, new_tag))
             
@@ -618,10 +756,22 @@ def clear_status_selected(app: App):
             
     # Update selection style to match new status
     update_selection_style(app)
+    update_counts(app)
 
 def on_tree_click(app: App, event):
+    """Handles clicks on the treeview (for checkbox toggle)."""
+    region = app.tbl.identify_region(event.x, event.y)
+    if region != 'cell':
+        return
+    
     iid = app.tbl.identify_row(event.y)
-    if not iid: return
+    if not iid:
+        return
+    
+    # Check if user clicked on Load More button
+    if iid == 'load_more_btn':
+        load_more_transactions(app)
+        return
     
     # Group header check removed
 
@@ -634,6 +784,7 @@ def on_tree_click(app: App, event):
 
 def update_selection_style(app: App):
     """Updates the Treeview selection color based on the status of selected rows."""
+    global DB_MANAGER
     sel = app.tbl.selection()
     keys = {s for s in sel if not s.startswith('group_')}
     
@@ -642,32 +793,33 @@ def update_selection_style(app: App):
         app.style.map("Treeview", background=[('selected', '#808080')], foreground=[('selected', 'white')])
         return
 
-    # Determine common status
-    statuses = [status_to_tag(STATUS.get(k, {})) for k in keys]
+    # Determine common status from SQLite
+    statuses = []
+    for k in keys:
+        pkg, stk = DB_MANAGER.get_status(k) if DB_MANAGER else (0, 0)
+        statuses.append(ColorConfig.get_status_tag(pkg, stk))
+    
     unique_statuses = set(statuses)
     
-    bg_color = '#808080' # Default Grey
-    fg_color = 'white'
-    bd_color = '#555555' # Default Dark Grey Border
+    bg_color = ColorConfig.SEL_DEFAULT
+    fg_color = ColorConfig.SEL_FG_DEFAULT
+    # bd_color is unused in new UI style as we use focus ring
     
     if len(unique_statuses) == 1:
         status = unique_statuses.pop()
-        if status == 'packaged': # Yellow
-            bg_color = '#e6dbaa' # Darker Yellow
-            fg_color = 'black'
-            bd_color = '#c4b88a' # Darker Yellow Border
-        elif status == 'sticker': # Blue
-            bg_color = '#b8d4f5' # Darker Blue
-            fg_color = 'black'
-            bd_color = '#98b4d5' # Darker Blue Border
-        elif status == 'both': # Green
-            bg_color = '#b8e6b8' # Darker Green
-            fg_color = 'black'
-            bd_color = '#98c698' # Darker Green Border
+        if status == 'packaged':
+            bg_color = ColorConfig.SEL_PKG
+            fg_color = ColorConfig.SEL_FG_DARK
+        elif status == 'sticker':
+            bg_color = ColorConfig.SEL_STK
+            fg_color = ColorConfig.SEL_FG_DARK
+        elif status == 'both':
+            bg_color = ColorConfig.SEL_BOTH
+            fg_color = ColorConfig.SEL_FG_DARK
             
     app.style.map("Treeview", background=[('selected', bg_color)], foreground=[('selected', fg_color)])
-    # Enforce Black Border (Focus Ring) for all selections
-    app.style.map("Treeview", focuscolor=[('selected', 'black'), ('!selected', 'white')])
+    # Enforce Black Focus Ring for all selections
+    app.style.map("Treeview", focuscolor=[('selected', ColorConfig.BORDER_FOCUS), ('!selected', 'white')])
 
 def on_select_change(app: App, event):
     update_selection_style(app)
@@ -730,11 +882,11 @@ def _guard_shortcut(app, fn):
 def _guarded_main():
     try: _main_inner()
     except Exception as e:
-        try: _mb.showerror("TrackNote Startup Error", f"Failed to start TrackNote:\n{e}\n\nCheck logs for details.")
+        try: _mb.showerror("TrackNote paleidimo klaida", f"Nepavyko paleisti TrackNote:\n{e}\n\nPatikrinkite žurnalus dėl išsamesnės informacijos.")
         except: pass
 
 def _main_inner():
-    global STATUS, FIREBASE_SYNC
+    global DB_MANAGER, FIREBASE_SYNC
     
     allowed, msg = check_trial()
     if not allowed:
@@ -742,11 +894,11 @@ def _main_inner():
         act = show_license_dialog(root)
         root.destroy()
         if not act:
-            _mb.showwarning("TrackNote", "Trial expired. Please contact support.")
+            _mb.showwarning("TrackNote", "Bandomoji versija baigėsi. Susisiekite su palaikymu.")
             return
         allowed, msg = check_trial()
         if not allowed:
-            _mb.showerror("TrackNote", "License activation failed.")
+            _mb.showerror("TrackNote", "Licencijos aktyvavimas nepavyko.")
             return
     
     app = App(); app.withdraw()
@@ -764,6 +916,19 @@ def _main_inner():
         cfg['workspace_id'] = namespace
         write_user_config(cfg)
     
+    # ===== INITIALIZE SQLite DATABASE =====
+    print(f"💾 Initializing local database for workspace: {namespace}")
+    try:
+        DB_MANAGER = DatabaseManager(namespace)
+        app.db_manager = DB_MANAGER
+        print("✅ Vietinė duomenų bazė paruošta")
+    except Exception as e:
+        print(f"❌ Duomenų bazės inicijavimas nepavyko: {e}")
+        _mb.showerror("Duomenų bazės klaida", f"Nepavyko inicijuoti vietinės duomenų bazės:\n{e}")
+        app.destroy()
+        return
+    
+    # ===== INITIALIZE FIREBASE (optional) =====
     firebase_config = load_firebase_config()
     if firebase_config:
         try:
@@ -852,10 +1017,13 @@ def _main_inner():
                 # We need to keep 'group_header' if it was there, but keys are usually transactions
                 current_tags = list(app.tbl.item(key, "tags"))
                 # Remove old status tags
-                for t in TAGS.keys():
+                for t in ColorConfig.get_tag_config().keys():
                     if t in current_tags: current_tags.remove(t)
                 current_tags.append(new_tag)
                 app.tbl.item(key, tags=tuple(current_tags))
+            
+            # Update counts on external change
+            update_counts(app)
             
             # Do NOT trigger full render for status changes
             needs_render = False
@@ -893,6 +1061,10 @@ def _main_inner():
 
     app.deiconify()
     app.mainloop()
+
+def main():
+    """Entry point for the launcher."""
+    _guarded_main()
 
 if __name__ == '__main__':
     _guarded_main()

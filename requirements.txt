@@ -7,3 +7,4 @@ ttkbootstrap==1.14.2
 pyinstaller==6.16.0
 cryptography==43.0.1
 requests==2.31.0
+pypdf==3.17.4

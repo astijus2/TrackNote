@@ -13,7 +13,6 @@ a = Analysis(
         ('app.py', '.'),
         ('ui.py', '.'),
         ('data_source.py', '.'),
-        ('setup_wizard.py', '.'),
         ('loading_screen.py', '.'),
         ('parsing.py', '.'),
         ('sheets_cache.py', '.'),
